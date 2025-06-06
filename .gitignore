@@ -1,0 +1,83 @@
+# ==============================================================================
+# .gitignore for Python PyQt GUI Application (Ultimate Sniffer & Downloader)
+# ==============================================================================
+
+# --- Python 缓存与自动生成文件 ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# --- 虚拟环境 ---
+# 如果您在项目目录内创建了虚拟环境，请取消注释对应行
+# myenv/
+# venv/
+# .venv/
+# env/
+# ENV/
+# venv.bak/
+# .env
+
+# --- PyInstaller 打包生成物 ---
+# 这些是打包过程中生成的临时文件和最终产品，不应纳入版本控制
+build/
+dist/
+*.spec
+
+# --- 日志文件与数据文件 ---
+# 程序运行时生成的日志文件
+*.log
+sniffer_gui.log
+
+# 用户下载的资源文件
+# 强烈建议将下载目录排除，避免意外提交大文件
+downloads/
+
+# --- IDE 和编辑器特定文件 ---
+# Visual Studio Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# --- 操作系统特定文件 ---
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.directory
+
+# --- 敏感信息 ---
+# 如果您未来会添加API密钥、代理认证等，可以创建一个 .env 文件来存放
+# 并确保它在这里被忽略
+.env
+.env.*
+*.env
+*.env.*
+!*.env.example
+!*.env.template
+
+# --- 依赖库相关 ---
+# 例如，如果使用 pip-tools
+# *.txt
+# !requirements.txt
+
+# --- Qt Designer 备份文件 ---
+# 如果您之前使用了Qt Designer，它可能会生成备份文件
+*.ui.bak
+
+# --- 个人或本地配置文件 ---
+# 任何包含本地路径或个人设置的文件
+local_settings.py
