@@ -4,210 +4,173 @@ import logging
 from PyQt6.QtWidgets import QApplication
 from app_window import AppWindow
 
-# --- 日志基础配置 ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("sniffer_gui.log", encoding='utf-8', mode='w'),
-        logging.StreamHandler()
-    ]
-)
+# (日志配置与上一版相同)
 
-# --- [全新] Emo朋克 / 忧郁霓虹 (Melancholy Neon) QSS 样式表 ---
-MELANCHOLY_NEON_QSS = """
-/* --- 全局样式 --- */
+# --- [全新] 精致Emo朋克 (Polished Emo-Punk) QSS 样式表 ---
+POLISHED_EMO_PUNK_QSS = """
+/* --- 全局与字体 --- */
 QWidget {
-    background-color: #161a21; /* 午夜蓝黑背景 */
-    color: #bdc3c7; /* 柔和的银灰色文本 */
-    font-family: "Roboto", "Segoe UI", "Helvetica Neue", sans-serif;
+    background-color: transparent;
+    color: #abb2bf; /* 柔和的灰白色 */
+    font-family: "Inter", "Segoe UI", "Roboto", sans-serif; /* 现代、清晰的字体 */
     font-size: 10pt;
-    border: none;
 }
 
 QMainWindow {
-    background-color: #0e1116;
+    background-color: #1e2127; /* 更深的蓝黑背景 */
 }
 
-/* --- 标签与文本 --- */
+/* --- 容器与分组 (使用QFrame) --- */
+QFrame#UrlFrame, QFrame#DownloadFrame {
+    background-color: rgba(44, 48, 58, 0.5); /* 半透明背景，模拟毛玻璃 */
+    border-radius: 8px;
+}
+
+/* --- 标签 --- */
 QLabel {
-    color: #7f8c8d; /* 石板灰 */
-    padding-left: 3px;
+    color: #6d7789;
     font-weight: bold;
+    padding-left: 3px;
 }
 
 /* --- 输入框、树、日志 --- */
 QLineEdit, QTextEdit, QTreeWidget {
-    background-color: #1f242d;
-    color: #ecf0f1;
-    border: 1px solid #2c3e50; /* 深邃的蓝灰色边框 */
-    border-radius: 4px;
+    background-color: #282c34;
+    color: #dbe0e8;
+    border: 1px solid #3a3f4b;
+    border-radius: 6px;
     padding: 8px;
-    selection-background-color: #8e44ad; /* 选中文字的背景：忧郁紫 */
 }
 
-QLineEdit:focus, QTextEdit:focus, QTreeWidget:focus {
-    border: 1px solid #3498db; /* 焦点时为电光蓝 */
+QLineEdit:focus, QTreeWidget:focus {
+    border: 1px solid #61afef; /* 清澈的蓝色焦点 */
+    background-color: #2c313a;
 }
 
+QTextEdit {
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 9.5pt;
+}
+
+/* --- 树形控件美化 --- */
 QTreeWidget::item {
-    padding: 4px 0;
+    padding: 6px;
+    border-radius: 4px;
 }
-
 QTreeWidget::item:hover {
-    background-color: rgba(52, 152, 219, 0.1); /* 悬停时为半透明的电光蓝 */
+    background-color: rgba(97, 175, 239, 0.1); /* 悬停时为蓝色微光 */
+}
+QTreeWidget::item:selected {
+    background-color: #61afef; /* 选中行为清澈蓝 */
+    color: #1e2127;
+}
+QTreeWidget::branch:has-children:!has-siblings:closed,
+QTreeWidget::branch:closed:has-children:has-siblings {
+    border-image: none;
+    image: url(none); /* 使用自定义或无图标 */
+}
+QTreeWidget::branch:open:has-children:!has-siblings,
+QTreeWidget::branch:open:has-children:has-siblings {
+    border-image: none;
+    image: url(none); /* 使用自定义或无图标 */
 }
 
-QTreeWidget::item:selected {
-    background-color: #8e44ad; /* 选中行为忧郁紫 */
-    color: #ffffff;
-}
 
 /* --- 按钮 --- */
 QPushButton {
-    background-color: #2c3e50; /* 深蓝灰 */
-    color: #ecf0f1;
-    border-radius: 4px;
-    padding: 8px 16px;
+    background-color: #3d4350;
+    color: #c8cdd6;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 18px;
     font-weight: bold;
-    outline: none;
 }
 
 QPushButton:hover {
-    background-color: #34495e;
+    background-color: #4a5160;
 }
 
 QPushButton:pressed {
-    background-color: #2c3e50;
-    padding-top: 9px;
-    padding-bottom: 7px;
+    background-color: #353a45;
 }
 
-/* --- 特殊按钮：嗅探/下载 --- */
-#StartButton, QPushButton[text=" 嗅探资源"] {
-    background-color: #8e44ad; /* 忧郁紫 */
-    color: white;
+/* --- 特殊按钮：嗅探、下载、停止 --- */
+#SniffButton, #StartButton {
+    background-color: #61afef; /* 清澈蓝 */
+    color: #1e2127;
 }
-#StartButton:hover, QPushButton[text=" 嗅探资源"]:hover {
-    background-color: #9b59b6;
-}
-#StartButton:pressed, QPushButton[text=" 嗅探资源"]:pressed {
-    background-color: #8e44ad;
+#SniffButton:hover, #StartButton:hover {
+    background-color: #71b9f9;
 }
 
-/* --- 特殊按钮：停止 --- */
 #StopButton {
-    background-color: #c0392b; /* 偏暗的石榴红 */
-    color: white;
+    background-color: #e06c75; /* 柔和的红色 */
+    color: #1e2127;
 }
 #StopButton:hover {
-    background-color: #e74c3c;
-}
-#StopButton:pressed {
-    background-color: #c0392b;
+    background-color: #f07c85;
 }
 
-#StartButton:disabled, #StopButton:disabled, QPushButton:disabled {
-    background-color: #2a2a2a;
-    color: #666;
+QPushButton:disabled {
+    background-color: #2c313a;
+    color: #5c6370;
 }
 
 /* --- 复选框 --- */
 QCheckBox {
-    color: #95a5a6;
+    color: #abb2bf;
     spacing: 8px;
 }
 QCheckBox::indicator {
-    width: 18px;
-    height: 18px;
-    border: 2px solid #2c3e50;
-    border-radius: 9px; /* 圆形 */
-    background-color: #1f242d;
+    width: 16px;
+    height: 16px;
+    border: 2px solid #3a3f4b;
+    border-radius: 5px;
 }
 QCheckBox::indicator:hover {
-    border-color: #3498db;
+    border-color: #61afef;
 }
 QCheckBox::indicator:checked {
-    background-color: #8e44ad;
-    border-color: #8e44ad;
+    background-color: #98c379; /* 选中时为清新的绿色 */
+    border-color: #98c379;
 }
 
 /* --- 进度条 --- */
 QProgressBar {
+    height: 10px;
     border: none;
     border-radius: 5px;
+    background-color: #2c313a;
     text-align: center;
-    color: rgba(255, 255, 255, 0.8);
-    background-color: #1f242d;
-    font-weight: bold;
 }
-
 QProgressBar::chunk {
-    background-color: #8e44ad; /* 忧郁紫进度 */
+    background-color: #98c379; /* 清新绿进度 */
     border-radius: 5px;
 }
 
-/* --- 表头 --- */
+/* --- 表头与分割条 --- */
 QHeaderView::section {
-    background-color: #1f242d;
-    color: #7f8c8d;
+    background-color: transparent;
+    color: #6d7789;
     padding: 8px;
     border: none;
-    border-bottom: 2px solid #2c3e50;
+    border-bottom: 2px solid #2c313a;
+    font-size: 9pt;
+    text-transform: uppercase;
 }
 
-/* --- 分割条 --- */
 QSplitter::handle {
-    background-color: #161a21;
-    width: 1px;
+    background-color: #2c313a;
+    width: 3px;
 }
 QSplitter::handle:hover {
-    background-color: #3498db;
-}
-
-/* --- 滚动条 --- */
-QScrollBar:vertical, QScrollBar:horizontal {
-    border: none;
-    background: #1f242d;
-    width: 8px;
-    height: 8px;
-    margin: 0px;
-}
-
-QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
-    background: #2c3e50;
-    min-height: 25px;
-    min-width: 25px;
-    border-radius: 4px;
-}
-QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
-    background: #34495e;
-}
-
-/* --- 右键菜单 --- */
-QMenu {
-    background-color: #1f242d;
-    border: 1px solid #2c3e50;
-    padding: 5px;
-}
-QMenu::item {
-    padding: 8px 25px;
-    border-radius: 4px;
-}
-QMenu::item:selected {
-    background-color: #8e44ad;
+    background-color: #61afef;
 }
 """
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    
-    # 应用全新的QSS样式
-    app.setStyleSheet(MELANCHOLY_NEON_QSS)
-    
-    # 创建并显示主窗口
+    app.setStyleSheet(POLISHED_EMO_PUNK_QSS)
     window = AppWindow()
     window.show()
-    
-    # 启动事件循环
     sys.exit(app.exec())

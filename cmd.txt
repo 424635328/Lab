@@ -1,3 +1,4 @@
-pyinstaller --onefile --windowed --name="资源嗅探器" --icon="icon.ico" --add-data="yt-dlp.exe;." --add-data="ffmpeg.exe;." --add-data="ffprobe.exe;." --collect-all "curl_cffi" --noconfirm main.py
+pyinstaller --onefile --windowed --name="src" --add-data="yt-dlp.exe;." --add-data="ffmpeg.exe;." --add-data="ffprobe.exe;." --collect-all "curl_cffi" --noconfirm main.py
 
 
+pyinstaller src.spec
