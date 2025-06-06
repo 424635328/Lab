@@ -1,0 +1,5 @@
+2025-06-07 01:03:16,538 - backend_scraper - INFO - 引擎[yt-dlp]: 开始嗅探 https://github.com/yt-dlp/yt-dlp/releases/tag/2025.05.22
+2025-06-07 01:03:23,155 - backend_scraper - ERROR - yt-dlp 嗅探失败: ERROR: Unsupported URL: https://github.com/yt-dlp/yt-dlp/releases/tag/2025.05.22
+2025-06-07 01:03:23,155 - backend_scraper - INFO - 引擎[HTML]: 开始嗅探 https://github.com/yt-dlp/yt-dlp/releases/tag/2025.05.22
+2025-06-07 01:03:25,930 - backend_scraper - INFO - 初步发现 170 个潜在链接。
+2025-06-07 01:03:25,931 - backend_scraper - INFO - 验证后发现 1 个有效资源。

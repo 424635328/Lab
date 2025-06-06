@@ -1,30 +1,36 @@
 # worker.py
+
 import logging
+import re
 import subprocess
-import json
 import os
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from backend_scraper import build_sniff_command, build_download_command
+# [修正] 导入正确的函数
+from backend_scraper import (
+    sniff_with_yt_dlp, 
+    sniff_with_deep_html_parser, 
+    build_download_command,  # 不再导入 download_with_yt_dlp
+    download_direct_link
+)
 
 logger = logging.getLogger(__name__)
 
 class Worker(QObject):
     sniff_finished = pyqtSignal(dict, str)
-    download_finished = pyqtSignal(bool, str) # 返回成功状态和可能的错误信息
-    log = pyqtSignal(str)
-    # 新增下载进度信号
+    download_finished = pyqtSignal(bool, str)
     download_progress = pyqtSignal(int)
+    log = pyqtSignal(str)
 
     def __init__(self, task_type, **kwargs):
         super().__init__()
         self.task_type = task_type
         self.kwargs = kwargs
-        self.process = None  # 用于持有子进程对象
-        self.is_running = True
+        self.process = None
+        self._is_running = True
 
     def run(self):
-        if not self.is_running: return
+        if not self._is_running: return
 
         if self.task_type == "sniff":
             self._run_sniff()
@@ -33,69 +39,97 @@ class Worker(QObject):
 
     def _run_sniff(self):
         url = self.kwargs.get("url")
-        command = build_sniff_command(url)
-        self.log.emit(f"后台：执行嗅探命令: {' '.join(command)}")
+        self.log.emit(f"后台：开始双引擎嗅探 {url}...")
         
-        try:
-            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore', creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            stdout, stderr = self.process.communicate()
+        self.log.emit("阶段 1: 尝试 yt-dlp 引擎...")
+        result = sniff_with_yt_dlp(url)
+        
+        if self._is_running and result.get("error") and "unsupported url" in result.get("error", "").lower():
+            self.log.emit("yt-dlp 不支持，切换到HTML深度嗅探引擎...")
+            result = sniff_with_deep_html_parser(url)
 
-            if not self.is_running: # 检查是否在中途被停止
-                self.sniff_finished.emit({"error": "操作被用户取消。"}, url)
-                return
-
-            if self.process.returncode == 0:
-                first_line = stdout.strip().split('\n')[0]
-                self.sniff_finished.emit(json.loads(first_line), url)
-            else:
-                self.sniff_finished.emit({"error": stderr.strip()}, url)
-        except Exception as e:
-            self.sniff_finished.emit({"error": str(e)}, url)
+        if self._is_running:
+            self.sniff_finished.emit(result, url)
 
     def _run_download(self):
+        resource_type = self.kwargs.get("resource_type")
+        
+        if resource_type == "yt-dlp":
+            self._run_yt_dlp_download()
+        else: # "direct"
+            self._run_direct_download()
+            
+    def _run_yt_dlp_download(self):
+        """[修正] 使用 build_download_command 并自己执行"""
         url = self.kwargs.get("url")
         formats = self.kwargs.get("formats")
         download_path = self.kwargs.get("download_path")
+        
+        # 1. 构建命令
         command = build_download_command(url, formats, download_path)
-        self.log.emit(f"后台：执行下载命令: {' '.join(command)}")
-
+        
+        # 2. 启动进程
         try:
-            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='ignore', creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            
-            # 实时解析yt-dlp的进度输出
+            self.process = subprocess.Popen(
+                command, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT, 
+                text=True, 
+                encoding='utf-8', 
+                errors='ignore',
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+        except Exception as e:
+            logger.error(f"启动 yt-dlp 下载进程失败: {e}")
+            self.download_finished.emit(False, f"启动下载失败: {e}")
+            return
+
+        # 3. 监控进程
+        try:
+            progress_pattern = re.compile(r"(\d+(\.\d+)?%)")
             for line in iter(self.process.stdout.readline, ''):
-                if not self.is_running:
+                if not self._is_running:
+                    self.log.emit("检测到停止信号，终止下载...")
                     self.process.terminate()
-                    self.process.wait()
-                    self.log.emit("下载被用户取消。")
+                    self.process.wait(timeout=5)
                     self.download_finished.emit(False, "操作被用户取消。")
                     return
                 
-                # yt-dlp的进度条格式通常是 [download] XX.X% of ...
-                if "[download]" in line and "%" in line:
+                self.log.emit(f"[yt-dlp] {line.strip()}") # 打印原始日志
+                match = progress_pattern.search(line)
+                if match:
                     try:
-                        percentage_str = line.split('%')[0].split()[-1]
-                        percentage = int(float(percentage_str))
+                        percentage = int(float(match.group(1).replace('%', '')))
                         self.download_progress.emit(percentage)
                     except (ValueError, IndexError):
-                        pass # 忽略无法解析的行
+                        pass
             
-            self.process.wait()
-            if self.process.returncode == 0:
-                self.download_progress.emit(100)
-                self.download_finished.emit(True, "下载成功完成。")
-            else:
-                self.download_finished.emit(False, f"下载失败，yt-dlp返回码: {self.process.returncode}")
-
+            return_code = self.process.wait()
+            if self._is_running:
+                if return_code == 0:
+                    self.download_progress.emit(100)
+                    self.download_finished.emit(True, "下载成功完成。")
+                else:
+                    self.download_finished.emit(False, f"下载失败，进程返回码: {return_code}")
         except Exception as e:
-            self.download_finished.emit(False, str(e))
+            logger.error(f"监控下载进程时出错: {e}")
+            if self._is_running:
+                self.download_finished.emit(False, f"监控下载时发生错误: {e}")
 
+    def _run_direct_download(self):
+        direct_url = self.kwargs.get("direct_url")
+        download_path = self.kwargs.get("download_path")
+        # 直接下载逻辑是阻塞的，未来可以改写成非阻塞
+        success, msg = download_direct_link(direct_url, download_path, progress_callback=self.download_progress.emit)
+        if self._is_running:
+            self.download_finished.emit(success, msg)
+            
     def stop(self):
+        self._is_running = False
         self.log.emit("后台：收到停止信号...")
-        self.is_running = False
-        if self.process:
+        if self.process and self.process.poll() is None:
             try:
                 self.log.emit(f"正在终止进程 ID: {self.process.pid}")
-                self.process.terminate() # 优雅地尝试终止
-            except ProcessLookupError:
-                self.log.emit("进程已不存在。")
+                self.process.terminate()
+            except Exception as e:
+                self.log.emit(f"终止进程时出错: {e}")
