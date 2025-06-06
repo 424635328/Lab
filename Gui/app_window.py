@@ -1,24 +1,31 @@
 # app_window.py
+
 import logging
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QMessageBox, QTextEdit, QSplitter, QTreeWidget, QTreeWidgetItem, QHeaderView,
-    QStatusBar, QMenu, QFileDialog, QTreeWidgetItemIterator, QApplication, QLabel, QStyle
+    QStatusBar, QMenu, QFileDialog, QTreeWidgetItemIterator, QCheckBox, QStyle,QApplication, QLabel
 )
 from PyQt6.QtCore import QThread, QSettings, QDir, Qt, QPoint
-from PyQt6.QtGui import QFont, QIcon, QAction, QBrush, QColor
+from PyQt6.QtGui import QFont, QIcon, QAction
 
 from worker import Worker  # 确保 worker.py 在同一目录下
 
 logger = logging.getLogger(__name__)
 
 class AppWindow(QMainWindow):
+    """
+    应用程序的主窗口类。
+    负责构建UI、处理用户交互、管理后台工作线程以及状态更新。
+    """
     def __init__(self):
         super().__init__()
         self.setWindowTitle("终极资源嗅探下载器")
         self.setGeometry(100, 100, 1200, 800)
 
         # --- 初始化状态和设置 ---
+        self.download_queue = []
+        self.current_download_url = ""
         self.worker = None
         self.thread = None
         self.settings = QSettings("MyCompany", "UltimateSnifferGUI")
@@ -30,24 +37,14 @@ class AppWindow(QMainWindow):
         self.set_controls_for_idle()
 
     def setup_ui(self):
-        """使用代码构建UI界面"""
+        """使用纯Python代码构建UI界面"""
         # --- 创建控件 ---
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("在此处粘贴要嗅探的URL")
         self.url_input.setFont(QFont("Segoe UI", 10))
 
-        self.action_button_layout = QHBoxLayout()
         self.sniff_button = QPushButton(" 嗅探资源")
-        self.download_button = QPushButton(" 下载选中项")
-        self.stop_button = QPushButton(" 停止操作")
         
-        self.download_button.setObjectName("StartButton")
-        self.stop_button.setObjectName("StopButton")
-        
-        self.action_button_layout.addWidget(self.sniff_button)
-        self.action_button_layout.addWidget(self.download_button)
-        self.action_button_layout.addWidget(self.stop_button)
-
         self.task_tree = QTreeWidget()
         self.task_tree.setHeaderLabels(["任务URL", "标题"])
         self.task_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -68,8 +65,19 @@ class AppWindow(QMainWindow):
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setFont(QFont("Courier New", 9))
+
+        # --- 下载操作区域 ---
+        self.merge_audio_checkbox = QCheckBox("自动合并最佳音轨")
+        self.merge_audio_checkbox.setChecked(True)
+        self.merge_audio_checkbox.setToolTip("勾选后，仅需选择视频流，程序将为每个视频流自动匹配最佳音轨进行合并。\n取消勾选则可手动选择视频和音频流进行合并。")
         
-        # --- [修正] 设置图标 ---
+        self.download_button = QPushButton(" 下载选中项")
+        self.download_button.setObjectName("StartButton")
+        
+        self.stop_button = QPushButton(" 停止操作")
+        self.stop_button.setObjectName("StopButton")
+
+        # --- 设置图标 ---
         style = self.style()
         self.sniff_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView))
         self.download_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
@@ -80,6 +88,7 @@ class AppWindow(QMainWindow):
         url_layout = QHBoxLayout()
         url_layout.addWidget(QLabel("URL:"))
         url_layout.addWidget(self.url_input, 1)
+        url_layout.addWidget(self.sniff_button)
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
@@ -91,11 +100,17 @@ class AppWindow(QMainWindow):
         path_layout.addWidget(self.path_input, 1)
         path_layout.addWidget(self.browse_button)
         
+        download_options_layout = QHBoxLayout()
+        download_options_layout.addWidget(self.merge_audio_checkbox)
+        download_options_layout.addStretch()
+        download_options_layout.addWidget(self.download_button)
+        download_options_layout.addWidget(self.stop_button) # 将所有按钮放在一个布局里
+        
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.addWidget(self.resource_tree)
         right_layout.addLayout(path_layout)
-        right_layout.addLayout(self.action_button_layout)
+        right_layout.addLayout(download_options_layout)
 
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         main_splitter.addWidget(left_panel)
@@ -111,30 +126,17 @@ class AppWindow(QMainWindow):
         self.setStatusBar(QStatusBar(self))
 
     def connect_signals(self):
+        """连接所有控件的信号与槽。"""
         self.sniff_button.clicked.connect(self.start_sniffing)
         self.url_input.returnPressed.connect(self.start_sniffing)
         self.task_tree.currentItemChanged.connect(self.display_resources)
         self.task_tree.customContextMenuRequested.connect(self.show_task_context_menu)
         self.browse_button.clicked.connect(self.browse_path)
-        self.download_button.clicked.connect(self.start_downloading)
+        self.download_button.clicked.connect(self.prepare_downloads)
         self.stop_button.clicked.connect(self.stop_task)
 
-    # --- [补全] 以下是所有被遗漏的辅助和事件处理函数 ---
-    
-    def load_settings(self):
-        default_path = QDir.home().filePath("Downloads")
-        path = self.settings.value("downloadPath", default_path)
-        self.path_input.setText(path)
-
-    def save_settings(self):
-        self.settings.setValue("downloadPath", self.path_input.text())
-        
-    def browse_path(self):
-        path = QFileDialog.getExistingDirectory(self, "选择下载文件夹", self.path_input.text())
-        if path:
-            self.path_input.setText(path)
-
     def start_sniffing(self):
+        """开始嗅探任务。"""
         url = self.url_input.text().strip()
         if not url: return
 
@@ -157,6 +159,7 @@ class AppWindow(QMainWindow):
         self.thread.start()
 
     def on_sniff_finished(self, data, url):
+        """嗅探完成后的处理。"""
         self.set_controls_for_idle()
 
         if data.get("error"):
@@ -175,6 +178,7 @@ class AppWindow(QMainWindow):
         self.thread.wait()
 
     def display_resources(self, current_item, previous_item):
+        """当任务列表选中项改变时，显示对应的资源。"""
         self.resource_tree.clear()
         if not current_item: return
 
@@ -213,66 +217,104 @@ class AppWindow(QMainWindow):
         
         self.resource_tree.expandAll()
 
-    def start_downloading(self):
-        selected_items = []
+    def prepare_downloads(self):
+        """准备下载任务并启动队列。"""
+        if self.thread and self.thread.isRunning():
+            QMessageBox.warning(self, "提示", "已有任务在进行中，请稍候。")
+            return
+
+        current_task_item = self.task_tree.currentItem()
+        if not current_task_item:
+            QMessageBox.warning(self, "提示", "请先在左侧选择一个任务。")
+            return
+        self.current_download_url = current_task_item.text(0)
+        
+        auto_merge = self.merge_audio_checkbox.isChecked()
+        self.download_queue = []
+
         iterator = QTreeWidgetItemIterator(self.resource_tree)
         while iterator.value():
             item = iterator.value()
             if item.checkState(0) == Qt.CheckState.Checked:
                 format_id = item.data(0, Qt.ItemDataRole.UserRole)
-                if format_id:
-                    selected_items.append(format_id)
+                if not format_id:
+                    iterator += 1
+                    continue
+                
+                if auto_merge:
+                    parent = item.parent()
+                    if parent and parent.text(0) == "视频流":
+                        self.download_queue.append(f"{format_id}+bestaudio")
+                else:
+                    self.download_queue.append(format_id)
             iterator += 1
 
-        if not selected_items:
-            QMessageBox.warning(self, "提示", "请先在资源列表中勾选要下载的格式。")
+        if not self.download_queue:
+            msg = "请在资源列表中勾选要下载的视频流。" if auto_merge else "请在资源列表中勾选要下载的格式。"
+            QMessageBox.warning(self, "提示", msg)
             return
         
-        format_string = "+".join(selected_items)
-        current_task_item = self.task_tree.currentItem()
-        if not current_task_item: return
-        url = current_task_item.text(0)
+        if not auto_merge:
+            self.download_queue = ["+".join(self.download_queue)]
         
-        self.set_controls_for_busy("正在下载...")
-        self.log_output.append(f"<b>开始下载: {url}，格式: {format_string}</b>")
+        self.log_output.append(f"<b>准备下载 {len(self.download_queue)} 个项目...</b>")
+        self.process_next_in_queue()
+
+    def process_next_in_queue(self):
+        """处理下载队列中的下一个任务。"""
+        if not self.download_queue:
+            self.log_output.append("<font color='green'><b>所有下载任务已完成！</b></font>")
+            self.set_controls_for_idle()
+            QMessageBox.information(self, "完成", "所有下载任务已处理完毕！")
+            return
+
+        format_string = self.download_queue.pop(0)
+        
+        status_msg = f"正在下载 (剩余 {len(self.download_queue)} 个)..."
+        self.set_controls_for_busy(status_msg)
+        self.log_output.append(f"<b>开始下载: {self.current_download_url}，格式代码: {format_string}</b>")
 
         self.thread = QThread()
-        worker = Worker("download", url=url, formats=format_string, download_path=self.path_input.text())
+        worker = Worker("download", url=self.current_download_url, formats=format_string, download_path=self.path_input.text())
         self.worker = worker
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
-        self.worker.download_finished.connect(self.on_download_finished)
+        self.worker.download_finished.connect(self.on_single_download_finished)
         self.worker.download_progress.connect(self.update_progress)
         self.worker.log.connect(self.log_output.append)
 
         self.thread.start()
 
-    def on_download_finished(self, success, message):
-        self.set_controls_for_idle()
+    def on_single_download_finished(self, success, message):
+        """单个下载任务完成后的处理。"""
         if success:
-            self.log_output.append(f"<font color='green'>{message}</font>")
-            QMessageBox.information(self, "成功", message)
+            self.log_output.append(f"<font color='green'>项目下载成功。</font>")
         else:
-            self.log_output.append(f"<font color='red'>下载失败: {message}</font>")
-            QMessageBox.critical(self, "失败", f"下载任务失败:\n{message}")
+            self.log_output.append(f"<font color='red'>项目下载失败: {message}</font>")
         
         self.thread.quit()
         self.thread.wait()
+        
+        self.process_next_in_queue()
 
     def stop_task(self):
+        """停止当前正在运行的任务。"""
         if self.thread and self.thread.isRunning() and self.worker:
             self.statusBar().showMessage("正在发送停止信号...", 3000)
             self.log_output.append("<b>[用户操作] 发送停止信号...</b>")
             self.worker.stop()
+            # UI状态将在 on_finished 信号中被重置
         else:
             self.log_output.append("当前没有正在运行的任务可停止。")
             self.set_controls_for_idle()
 
     def update_progress(self, value):
+        """更新状态栏进度信息。"""
         self.statusBar().showMessage(f"下载进度: {value}%")
 
     def show_task_context_menu(self, position: QPoint):
+        """显示任务列表的右键菜单。"""
         item = self.task_tree.itemAt(position)
         if not item: return
 
@@ -290,32 +332,53 @@ class AppWindow(QMainWindow):
             self.statusBar().showMessage("URL已复制到剪贴板", 2000)
 
     def remove_task(self, item):
+        """从任务列表和数据存储中移除任务。"""
         url = item.text(0)
         self.current_task_data.pop(url, None)
         self.task_tree.takeTopLevelItem(self.task_tree.indexOfTopLevelItem(item))
         self.resource_tree.clear()
 
     def set_controls_for_idle(self):
-        """设置UI为闲置状态"""
+        """设置UI为闲置状态。"""
         self.sniff_button.setVisible(True)
         self.download_button.setVisible(True)
+        self.merge_audio_checkbox.setVisible(True)
         self.stop_button.setVisible(False)
         self.url_input.setEnabled(True)
         self.browse_button.setEnabled(True)
         self.task_tree.setEnabled(True)
+        self.resource_tree.setEnabled(True)
         self.statusBar().showMessage("准备就绪")
 
     def set_controls_for_busy(self, message):
-        """设置UI为忙碌状态"""
+        """设置UI为忙碌状态。"""
         self.sniff_button.setVisible(False)
         self.download_button.setVisible(False)
+        self.merge_audio_checkbox.setVisible(False)
         self.stop_button.setVisible(True)
         self.url_input.setEnabled(False)
         self.browse_button.setEnabled(False)
         self.task_tree.setEnabled(False)
+        self.resource_tree.setEnabled(False)
         self.statusBar().showMessage(message)
 
+    def browse_path(self):
+        path = QFileDialog.getExistingDirectory(self, "选择下载文件夹", self.path_input.text())
+        if path:
+            self.path_input.setText(path)
+
+    def load_settings(self):
+        default_path = QDir.home().filePath("Downloads")
+        path = self.settings.value("downloadPath", default_path)
+        self.path_input.setText(path)
+        self.merge_audio_checkbox.setChecked(self.settings.value("autoMergeAudio", True, type=bool))
+
+    def save_settings(self):
+        self.settings.setValue("downloadPath", self.path_input.text())
+        self.settings.setValue("autoMergeAudio", self.merge_audio_checkbox.isChecked())
+
     def closeEvent(self, event):
+        """处理窗口关闭事件。"""
         self.save_settings()
         if self.thread and self.thread.isRunning():
             reply = QMessageBox.question(self, "确认退出", "任务仍在进行中，确定要退出吗？",
