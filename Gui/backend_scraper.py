@@ -2,14 +2,15 @@
 
 import logging
 import os
-import time
 import sys
+import time
 import json
 import re
 import subprocess
 from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
+import certifi
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +51,7 @@ def sniff_with_yt_dlp(url, proxy_dict=None):
     logger.info(f"引擎[yt-dlp]: 开始嗅探 {url}")
     yt_dlp_exe = get_executable_path("yt-dlp.exe")
     if not os.path.exists(yt_dlp_exe):
-        msg = f"yt-dlp.exe 未找到。检查路径: {yt_dlp_exe}"
-        logger.error(msg)
+        msg = f"yt-dlp.exe 未找到。请确保它在程序目录或系统PATH中。检查路径: {yt_dlp_exe}"
         return {"error": msg, "engine": "yt-dlp"}
 
     command = [yt_dlp_exe, "--dump-json", "--no-warnings", url]
@@ -68,86 +68,87 @@ def sniff_with_yt_dlp(url, proxy_dict=None):
         data['engine'] = 'yt-dlp'
         return data
     except subprocess.TimeoutExpired:
-        msg = "yt-dlp 嗅探超时（超过90秒）。"
-        return {"error": msg, "engine": "yt-dlp"}
+        return {"error": "yt-dlp 嗅探超时（超过90秒）。", "engine": "yt-dlp"}
     except subprocess.CalledProcessError as e:
-        error_output = e.stderr.strip()
-        return {"error": error_output, "engine": "yt-dlp"}
+        return {"error": e.stderr.strip(), "engine": "yt-dlp"}
     except Exception as e:
         return {"error": str(e), "engine": "yt-dlp"}
 
 def sniff_github_release_api(url):
-    """通过直接请求 GitHub API 来嗅探 Release 页面的资源。"""
+    """通过直接请求 GitHub API 来嗅探 Release 页面的资源，并使用个人访问令牌。"""
     logger.info(f"引擎[GitHub API]: 开始嗅探 {url}")
     match = re.search(r'github\.com/([^/]+)/([^/]+)/releases/tag/([^/?#]+)', url)
     if not match:
-        msg = "无法从URL中解析出 owner/repo/tag。"
-        return {"error": msg, "engine": "github_api"}
+        return {"error": "无法从URL中解析出 owner/repo/tag。", "engine": "github_api"}
 
     owner, repo, tag = match.groups()
     api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
     logger.info(f"构造API请求URL: {api_url}")
 
+    headers = {
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'Ultimate-Sniffer-App/1.0'
+    }
+    github_token = os.environ.get('GITHUB_TOKEN')
+    if github_token:
+        headers['Authorization'] = f"token {github_token}"
+        logger.info("检测到 GITHUB_TOKEN，已添加到请求头中。")
+    else:
+        logger.warning("未检测到 GITHUB_TOKEN 环境变量。将作为匿名用户请求，可能很快会达到速率限制。")
+
     try:
         response = requests.get(
             api_url, 
-            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'Ultimate-Sniffer-App'},
-            timeout=20
+            headers=headers,
+            timeout=30,
+            verify=certifi.where() 
         )
         response.raise_for_status()
         data = response.json()
 
         verified_links = []
         for asset in data.get("assets", []):
-            asset_url = asset.get("browser_download_url")
-            asset_name = asset.get("name")
-            asset_size = asset.get("size")
-            asset_content_type = asset.get("content_type")
-
+            asset_url, asset_name, asset_size, asset_content_type = asset.get("browser_download_url"), asset.get("name"), asset.get("size"), asset.get("content_type")
             if asset_url and asset_name:
                 _, ext = os.path.splitext(asset_name)
                 category = "其他"
                 for cat, exts in RESOURCE_CATEGORIES.items():
-                    if ext.lower() in exts:
-                        category = cat
-                        break
-                
-                verified_links.append({
-                    "url": asset_url, "filename": asset_name, "category": category,
-                    "size": asset_size, "mime": asset_content_type, "ext": ext.lower()
-                })
-
+                    if ext.lower() in exts: category = cat; break
+                verified_links.append({"url": asset_url, "filename": asset_name, "category": category, "size": asset_size, "mime": asset_content_type, "ext": ext.lower()})
+        
         return {
             "links": verified_links, 
             "title": data.get("name", f"{owner}/{repo} - {tag}"), 
             "engine": "github_api"
         }
     except requests.exceptions.HTTPError as e:
-        msg = f"GitHub API 请求失败 (状态码: {e.response.status_code})。可能是tag不存在或仓库私有。"
+        if e.response.status_code == 403:
+            msg = f"GitHub API 请求被拒绝 (403)。很可能是速率限制已超额。请设置 GITHUB_TOKEN 环境变量以提高限制。"
+        else:
+            msg = f"GitHub API 请求失败 (状态码: {e.response.status_code})。"
+        logger.error(msg)
+        return {"error": msg, "engine": "github_api"}
+    except requests.exceptions.RequestException as e:
+        msg = f"网络请求失败: {e}"
         return {"error": msg, "engine": "github_api"}
     except Exception as e:
-        return {"error": str(e), "engine": "github_api"}
+        return {"error": f"处理GitHub API时发生未知错误: {e}", "engine": "github_api"}
 
 def sniff_with_deep_html_parser(url, proxy_dict=None):
     """使用 requests 和 BeautifulSoup 进行深度嗅探。"""
     logger.info(f"引擎[HTML]: 开始嗅探 {url}")
     session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
+    session.headers.update({'User-Agent': 'Mozilla/5.0'})
     if proxy_dict: session.proxies = proxy_dict
 
     try:
-        main_response = session.get(url, timeout=20)
+        main_response = session.get(url, timeout=20, verify=certifi.where())
         main_response.raise_for_status()
-        
         soup = BeautifulSoup(main_response.text, 'html.parser')
         title = soup.title.string.strip() if soup.title and soup.title.string else "Untitled"
-
-        potential_urls = set()
-        for tag in soup.find_all(['a', 'img', 'video', 'audio', 'source'], href=True) + soup.find_all(['img', 'video', 'audio', 'source'], src=True):
-            link = tag.get('href') or tag.get('src')
-            if link and not link.startswith(('javascript:', '#', 'data:')):
-                potential_urls.add(urljoin(url, link))
-
+        
+        potential_urls = set(urljoin(url, tag.get('href') or tag.get('src')) for tag in soup.find_all(['a', 'img', 'video', 'audio', 'source'], href=True) + soup.find_all(['img', 'video', 'audio', 'source'], src=True) if tag.get('href') or tag.get('src'))
+        
         verified_links = []
         for link_url in potential_urls:
             path = urlparse(link_url).path
@@ -155,20 +156,16 @@ def sniff_with_deep_html_parser(url, proxy_dict=None):
             if ext:
                 for category, extensions in RESOURCE_CATEGORIES.items():
                     if ext.lower() in extensions:
-                        verified_links.append({
-                            "url": link_url,
-                            "filename": os.path.basename(path) or "unknown_file",
-                            "category": category, "ext": ext.lower(),
-                        })
+                        verified_links.append({"url": link_url, "filename": os.path.basename(path) or "unknown", "category": category, "ext": ext.lower()})
                         break
-        
         return {"links": verified_links, "title": title, "engine": "html"}
     except Exception as e:
         return {"error": str(e), "engine": "html"}
 
-# --- 下载引擎命令构建 ---
+# --- 下载引擎 ---
 
 def build_download_command(url, format_codes, download_dir, proxy_dict=None):
+    """构建 yt-dlp 下载命令。"""
     yt_dlp_exe = get_executable_path("yt-dlp.exe")
     ffmpeg_exe_path = get_executable_path("ffmpeg.exe")
     command = [
@@ -185,15 +182,14 @@ def build_download_command(url, format_codes, download_dir, proxy_dict=None):
     command.append(url)
     return command
 
-# --- 直接下载函数 ---
-
 def download_direct_link(url, download_dir, proxy_dict=None, progress_callback=None):
+    """使用 requests 下载直接链接，并报告进度。"""
     logger.info(f"直接下载链接: {url}")
     try:
         filename = os.path.basename(urlparse(url).path) or f"download_{int(time.time())}"
         filepath = os.path.join(download_dir, filename)
 
-        with requests.get(url, stream=True, proxies=proxy_dict, timeout=(5, 300)) as r:
+        with requests.get(url, stream=True, proxies=proxy_dict, timeout=(5, 300), verify=certifi.where()) as r:
             r.raise_for_status()
             total_size = int(r.headers.get('content-length', 0))
             downloaded_size = 0
@@ -203,8 +199,7 @@ def download_direct_link(url, download_dir, proxy_dict=None, progress_callback=N
                         f.write(chunk)
                         downloaded_size += len(chunk)
                         if total_size > 0 and progress_callback:
-                            percentage = int((downloaded_size / total_size) * 100)
-                            progress_callback(percentage)
+                            progress_callback(int((downloaded_size / total_size) * 100))
         if progress_callback: progress_callback(100)
         return True, "下载成功完成。"
     except Exception as e:

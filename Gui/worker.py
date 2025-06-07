@@ -41,7 +41,6 @@ class Worker(QObject):
         self.log.emit(f"后台：开始多策略嗅探 {url}...")
         
         result = None
-
         # 策略 1: 检查是否是 GitHub Release 页面
         if "github.com" in url and "/releases/tag/" in url:
             self.log.emit("检测到 GitHub Release 页面，使用专用API嗅探器...")
@@ -50,7 +49,6 @@ class Worker(QObject):
             # 策略 2: 默认的双引擎嗅探 (yt-dlp -> HTML)
             self.log.emit("阶段 1: 尝试 yt-dlp 引擎...")
             result = sniff_with_yt_dlp(url)
-            
             is_unsupported_url = "unsupported url" in result.get("error", "").lower()
             if self._is_running and result.get("error") and is_unsupported_url:
                 self.log.emit("yt-dlp 不支持，切换到HTML深度嗅探引擎作为备用方案...")
@@ -61,17 +59,13 @@ class Worker(QObject):
 
     def _run_download(self):
         resource_type = self.kwargs.get("resource_type")
-        
         if resource_type == "yt-dlp":
             self._run_yt_dlp_download()
         else: # "direct"
             self._run_direct_download()
             
     def _run_yt_dlp_download(self):
-        url = self.kwargs.get("url")
-        formats = self.kwargs.get("formats")
-        download_path = self.kwargs.get("download_path")
-        
+        url, formats, download_path = self.kwargs.get("url"), self.kwargs.get("formats"), self.kwargs.get("download_path")
         command = build_download_command(url, formats, download_path)
         
         try:
@@ -81,17 +75,14 @@ class Worker(QObject):
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
         except Exception as e:
-            logger.error(f"启动 yt-dlp 下载进程失败: {e}")
             self.download_finished.emit(False, f"启动下载失败: {e}")
             return
 
         try:
-            progress_pattern = re.compile(r"(\d+(\.\d+)?%)")
+            progress_pattern = re.compile(r"download-stream:(\s*\d+\.?\d*%)")
             for line in iter(self.process.stdout.readline, ''):
                 if not self._is_running:
-                    self.log.emit("检测到停止信号，终止下载...")
-                    self.process.terminate()
-                    self.process.wait(timeout=5)
+                    self.process.terminate(); self.process.wait(timeout=5)
                     self.download_finished.emit(False, "操作被用户取消。")
                     return
                 
@@ -99,37 +90,26 @@ class Worker(QObject):
                 match = progress_pattern.search(line)
                 if match:
                     try:
-                        percentage = int(float(match.group(1).replace('%', '')))
+                        percentage = int(float(match.group(1).strip().replace('%', '')))
                         self.download_progress.emit(percentage)
-                    except (ValueError, IndexError):
-                        pass
+                    except (ValueError, IndexError): pass
             
             return_code = self.process.wait()
             if self._is_running:
                 if return_code == 0:
-                    self.download_progress.emit(100)
-                    self.download_finished.emit(True, "下载成功完成。")
+                    self.download_progress.emit(100); self.download_finished.emit(True, "下载成功完成。")
                 else:
                     self.download_finished.emit(False, f"下载失败，进程返回码: {return_code}")
         except Exception as e:
-            logger.error(f"监控下载进程时出错: {e}")
-            if self._is_running:
-                self.download_finished.emit(False, f"监控下载时发生错误: {e}")
+            if self._is_running: self.download_finished.emit(False, f"监控下载时发生错误: {e}")
 
     def _run_direct_download(self):
-        direct_url = self.kwargs.get("direct_url")
-        download_path = self.kwargs.get("download_path")
-        # 直接下载逻辑是阻塞的，未来可以改写成非阻塞
+        direct_url, download_path = self.kwargs.get("direct_url"), self.kwargs.get("download_path")
         success, msg = download_direct_link(direct_url, download_path, progress_callback=self.download_progress.emit)
-        if self._is_running:
-            self.download_finished.emit(success, msg)
+        if self._is_running: self.download_finished.emit(success, msg)
             
     def stop(self):
         self._is_running = False
-        self.log.emit("后台：收到停止信号...")
         if self.process and self.process.poll() is None:
-            try:
-                self.log.emit(f"正在终止进程 ID: {self.process.pid}")
-                self.process.terminate()
-            except Exception as e:
-                self.log.emit(f"终止进程时出错: {e}")
+            try: self.process.terminate()
+            except Exception as e: logger.error(f"终止进程时出错: {e}")

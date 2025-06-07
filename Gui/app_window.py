@@ -5,10 +5,10 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QMessageBox, QTextEdit, QSplitter, QTreeWidget, QTreeWidgetItem, QHeaderView,
     QStatusBar, QMenu, QFileDialog, QTreeWidgetItemIterator, QCheckBox, QApplication,
-    QFrame,QStyle,QLabel  # 确保导入 QFrame
+    QFrame,QStyle, QLabel, QProgressBar, QStyleOptionProgressBar, QStylePainter
 )
 from PyQt6.QtCore import QThread, QSettings, QDir, Qt, QPoint
-from PyQt6.QtGui import QFont, QIcon, QAction,  QBrush, QColor 
+from PyQt6.QtGui import QFont, QIcon, QAction,  QBrush, QColor
 
 from worker import Worker  # 确保 worker.py 在同一目录下
 
@@ -21,7 +21,7 @@ class AppWindow(QMainWindow):
     """
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("终极资源嗅探下载器 v3.0")
+        self.setWindowTitle("终极资源嗅探下载器 v2.4")
         self.setGeometry(100, 100, 1200, 800)
 
         # --- 初始化状态和设置 ---
@@ -39,7 +39,7 @@ class AppWindow(QMainWindow):
         self.set_controls_for_idle()
 
     def setup_ui(self):
-        """[重构] 使用 QFrame 进行视觉分组，以适配精致版QSS。"""
+        """使用纯Python代码构建UI界面"""
         # --- 创建控件 ---
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("在此处粘贴要嗅探的URL")
@@ -79,6 +79,12 @@ class AppWindow(QMainWindow):
         self.stop_button = QPushButton(" 停止操作")
         self.stop_button.setObjectName("StopButton")
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
+
         # --- 设置图标 ---
         style = self.style()
         self.sniff_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView))
@@ -87,8 +93,6 @@ class AppWindow(QMainWindow):
         self.browse_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
 
         # --- 使用 QFrame 进行视觉分组 ---
-        
-        # URL 输入区
         url_frame = QFrame()
         url_frame.setObjectName("UrlFrame")
         url_layout = QHBoxLayout(url_frame)
@@ -97,7 +101,6 @@ class AppWindow(QMainWindow):
         url_layout.addWidget(self.url_input, 1)
         url_layout.addWidget(self.sniff_button)
 
-        # 下载操作区
         download_frame = QFrame()
         download_frame.setObjectName("DownloadFrame")
         download_layout = QVBoxLayout(download_frame)
@@ -116,7 +119,7 @@ class AppWindow(QMainWindow):
         
         download_layout.addLayout(path_layout)
         download_layout.addLayout(action_layout)
-
+        download_layout.addWidget(self.progress_bar)
 
         # --- 主要布局 ---
         left_panel = QWidget()
@@ -159,9 +162,7 @@ class AppWindow(QMainWindow):
         self.stop_button.clicked.connect(self.stop_task)
 
     def start_sniffing(self):
-        if self.is_busy:
-            self.statusBar().showMessage("任务进行中，请稍候...", 2000)
-            return
+        if self.is_busy: return
         url = self.url_input.text().strip()
         if not url: return
 
@@ -185,24 +186,21 @@ class AppWindow(QMainWindow):
         
         self.current_task_data[url] = data
         if data.get("error"):
-            error_msg = data['error']
-            self.log_output.append(f"<font color='#e06c75'>嗅探失败: {error_msg}</font>")
             task_item.setText(1, "[嗅探失败]")
-            task_item.setForeground(1, QBrush(QColor("#e5c07b"))) # 警告黄
+            task_item.setForeground(1, QBrush(QColor("#ffc107")))
         else:
             title = data.get('title', '无标题')
-            self.log_output.append(f"<font color='#98c379'>嗅探成功: {title}</font>")
             task_item.setText(1, title)
             task_item.setForeground(1, QBrush(self.palette().text().color()))
         
-        if not existing_items:
-            self.task_tree.addTopLevelItem(task_item)
+        if not existing_items: self.task_tree.addTopLevelItem(task_item)
         self.task_tree.setCurrentItem(task_item)
         
+        self.is_busy = False
+        self.set_controls_for_idle()
         self.thread.quit()
         self.thread.wait()
-        self.thread, self.worker, self.is_busy = None, None, False
-        self.set_controls_for_idle()
+        self.thread, self.worker = None, None
 
     def display_resources(self, current_item, previous_item):
         self.resource_tree.clear()
@@ -216,20 +214,26 @@ class AppWindow(QMainWindow):
         elif engine in ["html", "github_api"]: self.display_html_resources(data)
 
     def display_yt_dlp_resources(self, data):
-        style = self.style()
-        video_icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
-        audio_icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaVolume)
+        """[修改] 在存储数据时，增加 is_video_only 标志。"""
+        style = self.style(); video_icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay); audio_icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaVolume)
         video_root = QTreeWidgetItem(self.resource_tree, ["视频流"]); video_root.setIcon(0, video_icon)
         audio_root = QTreeWidgetItem(self.resource_tree, ["音频流"]); audio_root.setIcon(0, audio_icon)
 
         for f in data.get("formats", []):
             is_video = f.get('vcodec') != 'none'
+            is_audio = f.get('acodec') != 'none'
+            is_video_only = is_video and not is_audio
+
             filesize = f"{(f.get('filesize') or f.get('filesize_approx', 0)) / 1024 / 1024:.2f} MB" if (f.get('filesize') or f.get('filesize_approx')) else "N/A"
             item_text = [f.get('format_note', f.get('format_id', 'N/A')), f"{f.get('vcodec', 'none')} / {f.get('acodec', 'none')}", f.get('resolution', '纯音频'), filesize, f.get('ext', 'N/A')]
             
             parent = video_root if is_video else audio_root
             item = QTreeWidgetItem(parent, item_text)
-            item.setData(0, Qt.ItemDataRole.UserRole, {"type": "yt-dlp", "format_id": f.get('format_id'), "is_video": is_video})
+            item.setData(0, Qt.ItemDataRole.UserRole, {
+                "type": "yt-dlp", 
+                "format_id": f.get('format_id'), 
+                "is_video_only": is_video_only # <--- 新增标志
+            })
             item.setCheckState(0, Qt.CheckState.Unchecked)
         self.resource_tree.expandAll()
 
@@ -237,25 +241,23 @@ class AppWindow(QMainWindow):
         category_roots = {}
         for link in data.get("links", []):
             category_name = link.get("category", "其他")
-            if category_name not in category_roots:
-                category_roots[category_name] = QTreeWidgetItem(self.resource_tree, [category_name])
-
-            parent = category_roots[category_name]
+            if category_name not in category_roots: category_roots[category_name] = QTreeWidgetItem(self.resource_tree, [category_name])
             filesize_mb = f"{link.get('size') / 1024 / 1024:.2f} MB" if isinstance(link.get('size'), int) else "未知"
             item_text = [link.get("filename", "N/A"), link.get("mime", link.get("ext")), "", filesize_mb, link.get("url")]
-            item = QTreeWidgetItem(parent, item_text)
-            item.setCheckState(0, Qt.CheckState.Unchecked)
-            item.setData(0, Qt.ItemDataRole.UserRole, {"type": "direct", "url": link.get("url")})
+            item = QTreeWidgetItem(category_roots[category_name], item_text)
+            item.setCheckState(0, Qt.CheckState.Unchecked); item.setData(0, Qt.ItemDataRole.UserRole, {"type": "direct", "url": link.get("url")})
         self.resource_tree.expandAll()
 
     def prepare_downloads(self):
+        """[重构] 修正智能合并逻辑。"""
         if self.is_busy: return
         current_task_item = self.task_tree.currentItem()
-        if not current_task_item: return
+        if not current_task_item:
+            QMessageBox.warning(self, "提示", "请先在左侧选择一个任务。")
+            return
+            
         self.current_download_info = {"base_url": current_task_item.text(0)}
-        
-        self.download_queue = []
-        yt_dlp_formats, auto_merge = [], self.merge_audio_checkbox.isChecked()
+        self.download_queue, yt_dlp_formats_manual, auto_merge = [], [], self.merge_audio_checkbox.isChecked()
         iterator = QTreeWidgetItemIterator(self.resource_tree)
         while iterator.value():
             item = iterator.value()
@@ -263,17 +265,18 @@ class AppWindow(QMainWindow):
                 download_info = item.data(0, Qt.ItemDataRole.UserRole)
                 if not download_info: continue
                 
-                if download_info["type"] == "direct":
-                    self.download_queue.append(download_info)
+                if download_info["type"] == "direct": self.download_queue.append(download_info)
                 elif download_info["type"] == "yt-dlp":
-                    if auto_merge and download_info.get("is_video"):
-                        self.download_queue.append({"type": "yt-dlp", "format_id": f"{download_info['format_id']}+bestaudio"})
-                    elif not auto_merge:
-                        yt_dlp_formats.append(download_info['format_id'])
+                    if auto_merge:
+                        if download_info.get("is_video_only"):
+                            self.download_queue.append({"type": "yt-dlp", "format_id": f"{download_info['format_id']}+bestaudio"})
+                        else:
+                            self.download_queue.append({"type": "yt-dlp", "format_id": download_info['format_id']})
+                    else:
+                        yt_dlp_formats_manual.append(download_info['format_id'])
             iterator += 1
         
-        if not auto_merge and yt_dlp_formats:
-            self.download_queue.append({"type": "yt-dlp", "format_id": "+".join(yt_dlp_formats)})
+        if not auto_merge and yt_dlp_formats_manual: self.download_queue.append({"type": "yt-dlp", "format_id": "+".join(yt_dlp_formats_manual)})
         if not self.download_queue:
             QMessageBox.warning(self, "提示", "请在资源列表中勾选要下载的项目。")
             return
@@ -284,104 +287,67 @@ class AppWindow(QMainWindow):
 
     def process_next_in_queue(self):
         if not self.download_queue:
-            self.log_output.append("<font color='#98c379'><b>所有下载任务已处理完毕！</b></font>")
-            self.is_busy = False
-            self.set_controls_for_idle()
-            QMessageBox.information(self, "完成", "所有下载任务已处理完毕！")
+            self.log_output.append("<font color='#98c379'><b>所有下载任务已处理完毕！</b></font>"); self.is_busy = False; self.set_controls_for_idle(); QMessageBox.information(self, "完成", "所有下载任务已处理完毕！")
             return
-
         task = self.download_queue.pop(0)
-        status_msg = f"正在下载 (队列剩余 {len(self.download_queue)} 个)..."
-        self.set_controls_for_busy(status_msg)
-        
-        worker_kwargs = {"download_path": self.path_input.text()}
-        task_type = task["type"]
+        self.set_controls_for_busy(f"正在下载 (队列剩余 {len(self.download_queue)} 个)...")
+        task_type = task["type"]; worker_kwargs = {"download_path": self.path_input.text()}
         if task_type == "direct":
-            worker_kwargs.update({"resource_type": "direct", "direct_url": task['url']})
-            self.log_output.append(f"<b>开始直接下载: {task['url']}</b>")
-        else: # yt-dlp
-            worker_kwargs.update({"resource_type": "yt-dlp", "url": self.current_download_info['base_url'], "formats": task['format_id']})
-            self.log_output.append(f"<b>开始yt-dlp下载: {self.current_download_info['base_url']}，格式: {task['format_id']}</b>")
-
-        self.thread = QThread()
-        self.worker = Worker("download", **worker_kwargs)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.download_finished.connect(self.on_single_download_finished)
-        self.worker.download_progress.connect(self.update_progress)
-        self.worker.log.connect(self.log_output.append)
+            worker_kwargs.update({"resource_type": "direct", "direct_url": task['url']}); self.log_output.append(f"<b>开始直接下载: {task['url']}</b>")
+        else:
+            worker_kwargs.update({"resource_type": "yt-dlp", "url": self.current_download_info['base_url'], "formats": task['format_id']}); self.log_output.append(f"<b>开始yt-dlp下载: ...，格式: {task['format_id']}</b>")
+        
+        self.thread = QThread(); self.worker = Worker("download", **worker_kwargs); self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run); self.worker.download_finished.connect(self.on_single_download_finished); self.worker.download_progress.connect(self.update_progress); self.worker.log.connect(self.log_output.append)
         self.thread.start()
 
     def on_single_download_finished(self, success, message):
         if success: self.log_output.append(f"<font color='#98c379'>项目下载成功。</font>")
         else: self.log_output.append(f"<font color='#e06c75'>项目下载失败: {message}</font>")
-        self.thread.quit()
-        self.thread.wait()
-        self.thread, self.worker = None, None
+        self.thread.quit(); self.thread.wait(); self.thread, self.worker = None, None
         self.process_next_in_queue()
 
     def stop_task(self):
         if self.worker:
-            self.statusBar().showMessage("正在发送停止信号...", 3000)
-            self.log_output.append("<b>[用户操作] 发送停止信号...</b>")
-            self.worker.stop()
-            self.download_queue = [] # 清空队列
-            self.is_busy = False
-            self.set_controls_for_idle()
-        else: self.set_controls_for_idle()
+            self.log_output.append("<b>[用户操作] 发送停止信号...</b>"); self.worker.stop(); self.download_queue = []
+            self.is_busy = False; self.set_controls_for_idle()
 
     def update_progress(self, value):
+        self.progress_bar.setValue(value)
         self.statusBar().showMessage(f"下载进度: {value}%")
 
     def show_task_context_menu(self, position: QPoint):
-        item = self.task_tree.itemAt(position)
+        item = self.task_tree.itemAt(position);
         if not item: return
-        menu = QMenu()
-        style = self.style()
+        menu = QMenu(); style = self.style()
         remove_action = menu.addAction(style.standardIcon(QStyle.StandardPixmap.SP_DialogCancelButton), "移除此任务")
         copy_url_action = menu.addAction(style.standardIcon(QStyle.StandardPixmap.SP_FileLinkIcon), "复制URL")
         action = menu.exec(self.task_tree.mapToGlobal(position))
-        
         if action == remove_action: self.remove_task(item)
-        elif action == copy_url_action: 
-            QApplication.clipboard().setText(item.text(0))
-            self.statusBar().showMessage("URL已复制到剪贴板", 2000)
+        elif action == copy_url_action: QApplication.clipboard().setText(item.text(0)); self.statusBar().showMessage("URL已复制到剪贴板", 2000)
 
     def remove_task(self, item):
-        url = item.text(0)
-        self.current_task_data.pop(url, None)
         self.task_tree.takeTopLevelItem(self.task_tree.indexOfTopLevelItem(item))
+        self.current_task_data.pop(item.text(0), None)
         self.resource_tree.clear()
 
     def set_controls_for_idle(self):
-        """设置UI为闲置状态。"""
-        self.sniff_button.setVisible(True)
-        self.download_button.setVisible(True)
-        self.merge_audio_checkbox.setVisible(True)
-        self.stop_button.setVisible(False)
-        for w in [self.url_input, self.browse_button, self.task_tree, self.resource_tree, self.merge_audio_checkbox]:
-            w.setEnabled(True)
-        self.statusBar().showMessage("准备就绪")
+        self.sniff_button.setVisible(True); self.download_button.setVisible(True); self.merge_audio_checkbox.setVisible(True); self.stop_button.setVisible(False)
+        for w in [self.url_input, self.browse_button, self.task_tree, self.resource_tree, self.merge_audio_checkbox]: w.setEnabled(True)
+        self.statusBar().showMessage("准备就绪"); self.progress_bar.setVisible(False)
 
     def set_controls_for_busy(self, message):
-        """设置UI为忙碌状态。"""
-        self.sniff_button.setVisible(False)
-        self.download_button.setVisible(False)
-        self.merge_audio_checkbox.setVisible(False)
-        self.stop_button.setVisible(True)
-        for w in [self.url_input, self.browse_button, self.task_tree, self.resource_tree]:
-            w.setEnabled(False)
-        self.statusBar().showMessage(message)
+        self.sniff_button.setVisible(False); self.download_button.setVisible(False); self.merge_audio_checkbox.setVisible(False); self.stop_button.setVisible(True)
+        for w in [self.url_input, self.browse_button, self.task_tree, self.resource_tree]: w.setEnabled(False)
+        self.statusBar().showMessage(message); self.progress_bar.setVisible(True); self.progress_bar.setValue(0)
 
     def browse_path(self):
         path = QFileDialog.getExistingDirectory(self, "选择下载文件夹", self.path_input.text())
-        if path:
-            self.path_input.setText(path)
+        if path: self.path_input.setText(path)
 
     def load_settings(self):
         default_path = QDir.home().filePath("Downloads")
-        path = self.settings.value("downloadPath", default_path)
-        self.path_input.setText(path)
+        self.path_input.setText(self.settings.value("downloadPath", default_path))
         self.merge_audio_checkbox.setChecked(self.settings.value("autoMergeAudio", True, type=bool))
 
     def save_settings(self):
@@ -391,16 +357,9 @@ class AppWindow(QMainWindow):
     def closeEvent(self, event):
         self.save_settings()
         if self.is_busy:
-            reply = QMessageBox.question(self, "确认退出", "任务仍在进行中，确定要退出吗？",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                         QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
+            if QMessageBox.question(self, "确认退出", "任务仍在进行中，确定要退出吗？") == QMessageBox.StandardButton.Yes:
                 if self.worker: self.worker.stop()
-                if self.thread:
-                    self.thread.quit()
-                    self.thread.wait()
+                if self.thread: self.thread.quit(); self.thread.wait()
                 event.accept()
-            else:
-                event.ignore()
-        else:
-            super().closeEvent(event)
+            else: event.ignore()
+        else: super().closeEvent(event)
