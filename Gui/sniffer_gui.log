@@ -1,6 +1,0 @@
-2025-06-07 01:10:17,933 - backend_scraper - INFO - 引擎[yt-dlp]: 开始嗅探 https://www.gyan.dev/ffmpeg/builds/
-2025-06-07 01:10:22,357 - backend_scraper - INFO - 引擎[HTML]: 开始嗅探 https://www.gyan.dev/ffmpeg/builds/
-2025-06-07 01:10:38,633 - backend_scraper - INFO - 引擎[GitHub API]: 开始嗅探 https://github.com/yt-dlp/yt-dlp/releases/tag/2025.05.22
-2025-06-07 01:10:38,635 - backend_scraper - INFO - 构造API请求URL: https://api.github.com/repos/yt-dlp/yt-dlp/releases/tags/2025.05.22
-2025-06-07 01:10:48,968 - backend_scraper - INFO - 引擎[yt-dlp]: 开始嗅探 https://sf16-sg-default.akamaized.net/obj/tos-alisg-ve-0051c001-sg/oU07ij66wv3mAIRpztEDCmiTBTAXofP8AMYLB6
-2025-06-07 01:10:54,614 - backend_scraper - INFO - 引擎[yt-dlp]: 开始嗅探 https://www.bilibili.com/video/BV15L4y1K7zE/?spm_id_from=333.337.search-card.all.click&vd_source=e8477097a1d7fbfe153d0a6007c033b8
