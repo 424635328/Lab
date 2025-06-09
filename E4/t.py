@@ -1,5 +1,6 @@
 import os
 # 设置 KMP_DUPLICATE_LIB_OK 环境变量以解决 OpenMP 冲突
+# This should be set BEFORE importing torch or numpy heavily
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 import shutil
 import pandas as pd
@@ -17,8 +18,8 @@ import seaborn as sns
 from PIL import Image
 import glob # 用于查找文件路径
 import random # 用于随机选择示例
-# import json # Uncomment if you need to save report_dict as JSON
-
+import json # Uncomment if you need to save report_dict as JSON
+import traceback # Import traceback for detailed error printing
 
 # --- Configuration Parameters ---
 # Please set this path to the directory containing the colonoscopy_dataset folder
@@ -43,11 +44,14 @@ FRAMES_PER_VIDEO = 30 # Number of frames to uniformly extract from each video
 # Image Preprocessing Parameters
 IMG_SIZE = (224, 224) # Model input image size (e.g., 224x224 for ResNet)
 BATCH_SIZE = 32
-NUM_WORKERS = 0 # Number of processes for data loading (adjust based on your system, 0 for no multiprocessing)
+# NUM_WORKERS = 0 # Number of processes for data loading (adjust based on your system, 0 for no multiprocessing)
+# Keeping NUM_WORKERS = 0 as per previous runs to simplify debugging DataLoader issues
+NUM_WORKERS = 0
+
 
 # Model Training Parameters
 MODEL_NAME = 'resnet18' # The pretrained model architecture: resnet18, resnet50 etc.
-NUM_EPOCHS = 1
+NUM_EPOCHS = 30
 LEARNING_RATE = 0.001
 TRAIN_VALID_SPLIT_RATIO = 0.8 # Training set + Validation set percentage of total frames
 VALID_TEST_SPLIT_RATIO = 0.5 # Validation and Test sets each take this percentage of the remaining frames
@@ -129,16 +133,59 @@ class ColonoscopyFrameDataset(Dataset):
         img_path = img_info['img_path']
         label = img_info['label']
 
-        # Use PIL to load image, compatible with torchvision transform
-        image = Image.open(img_path).convert('RGB') # Ensure RGB format
+        try:
+            # Use PIL to load image, compatible with torchvision transform
+            image = Image.open(img_path).convert('RGB') # Ensure RGB format
 
-        if self.transform:
-            image = self.transform(image)
+            if self.transform:
+                image = self.transform(image)
 
-        # Return image tensor, label (int), and the info dictionary
-        # The info dictionary is returned as a list/tuple by DataLoader for a batch,
-        # need to handle this during collection in evaluate_model
-        return image, label, img_info
+            # Return image tensor, label (int), and the info dictionary
+            return image, label, img_info
+
+        except Exception as e:
+            # Handle errors during image loading or transformation
+            print(f"Error processing image {img_path} (index {idx}): {e}")
+            # Return None for image and label, but return the img_info dictionary
+            # This allows the custom collate_fn to filter out the bad image
+            # but still keep the metadata for potential debugging or tracking.
+            # Returning label -1 as a placeholder for a failed sample.
+            return None, -1, img_info
+
+
+# --- Custom Collate Function ---
+# This function is used by DataLoader to combine individual samples into batches.
+# It handles cases where __getitem__ returns None for the image.
+def custom_collate_fn(batch):
+    # 'batch' is a list of tuples from Dataset.__getitem__, e.g.,
+    # [(img_tensor_1, label_1, info_dict_1), (img_tensor_2, label_2, info_dict_2), ...]
+    # Some img_tensor might be None if loading/transform failed.
+
+    # Filter out samples where image loading/transform failed (image is None)
+    # Keep only the items where the first element (image) is not None.
+    # Ensure the item is a tuple of length 3 first for safety.
+    batch = [item for item in batch if isinstance(item, (list, tuple)) and len(item) == 3 and item[0] is not None]
+
+    # If the batch is empty after filtering (e.g., all samples failed), return empty tensors and lists.
+    if not batch:
+        # Return empty tensors with expected shapes and empty info list
+        # The shape [0, 3, IMG_SIZE[0], IMG_SIZE[1]] indicates an empty batch of images
+        return torch.empty(0, 3, IMG_SIZE[0], IMG_SIZE[1]), torch.empty(0, dtype=torch.long), []
+
+    # Separate the components of the valid samples
+    images = [item[0] for item in batch]   # List of image tensors
+    labels = [item[1] for item in batch]   # List of label integers
+    infos = [item[2] for item in batch]    # List of img_info dictionaries
+
+    # Stack the valid image tensors and label integers
+    images_tensor = torch.stack(images, 0) # Stack list of tensors into a batch tensor
+    labels_tensor = torch.tensor(labels, dtype=torch.long) # Convert list of ints to a label tensor
+
+    # Return the stacked tensors and the corresponding list of info dictionaries
+    # The length of images_tensor, labels_tensor, and infos will now match
+    collated_batch = (images_tensor, labels_tensor, infos)
+
+    return collated_batch
 
 
 # --- Model Building ---
@@ -174,9 +221,16 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         model.train() # Set model to training mode
         running_loss = 0.0
         running_corrects = 0
+        processed_samples_train = 0
 
         # Iterate over data
-        for inputs, labels, _ in train_loader: # DataLoader returns inputs, labels, img_info (info is ignored in train/val)
+        # DataLoader returns inputs, labels, img_info (info is ignored in train/val)
+        # Using custom_collate_fn, inputs and labels only contain valid samples
+        for inputs, labels, _ in train_loader:
+            # Skip batch if no valid images were loaded
+            if inputs.size(0) == 0:
+                 continue
+
             inputs = inputs.to(device)
             labels = labels.to(device)
 
@@ -197,22 +251,31 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             # statistics
             running_loss += loss.item() * inputs.size(0)
             running_corrects += torch.sum(preds == labels.data)
+            processed_samples_train += inputs.size(0) # Count actual samples processed
 
-        epoch_loss = running_loss / len(train_loader.dataset)
-        epoch_acc = running_corrects.double() / len(train_loader.dataset)
+
+        # Calculate epoch loss and accuracy based on processed samples
+        epoch_loss = running_loss / processed_samples_train if processed_samples_train > 0 else 0.0
+        epoch_acc = running_corrects.double() / processed_samples_train if processed_samples_train > 0 else 0.0
 
         train_losses.append(epoch_loss)
-        train_accs.append(epoch_acc.item())
+        train_accs.append(epoch_acc.item() if isinstance(epoch_acc, torch.Tensor) else epoch_acc)
 
-        print(f'Epoch {epoch+1}/{num_epochs} Train Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+
+        print(f'Epoch {epoch+1}/{num_epochs} Train Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f} ({processed_samples_train} samples)')
 
         # --- Validation Phase ---
         model.eval() # Set model to evaluate mode
         running_loss_val = 0.0
         running_corrects_val = 0
+        processed_samples_val = 0
 
         with torch.no_grad(): # Disable gradient calculation for validation
             for inputs_val, labels_val, _ in val_loader:
+                 # Skip batch if no valid images were loaded
+                if inputs_val.size(0) == 0:
+                     continue
+
                 inputs_val = inputs_val.to(device)
                 labels_val = labels_val.to(device)
 
@@ -222,14 +285,17 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
 
                 running_loss_val += loss_val.item() * inputs_val.size(0)
                 running_corrects_val += torch.sum(preds_val == labels_val.data)
+                processed_samples_val += inputs_val.size(0)
 
-        epoch_loss_val = running_loss_val / len(val_loader.dataset)
-        epoch_acc_val = running_corrects_val.double() / len(val_loader.dataset)
+
+        epoch_loss_val = running_loss_val / processed_samples_val if processed_samples_val > 0 else 0.0
+        epoch_acc_val = running_corrects_val.double() / processed_samples_val if processed_samples_val > 0 else 0.0
 
         val_losses.append(epoch_loss_val)
-        val_accs.append(epoch_acc_val.item())
+        val_accs.append(epoch_acc_val.item() if isinstance(epoch_acc_val, torch.Tensor) else epoch_acc_val)
 
-        print(f'Epoch {epoch+1}/{num_epochs} Val Loss: {epoch_loss_val:.4f} Acc: {epoch_acc_val:.4f}')
+
+        print(f'Epoch {epoch+1}/{num_epochs} Val Loss: {epoch_loss_val:.4f} Acc: {epoch_acc_val:.4f} ({processed_samples_val} samples)')
 
         # --- Optional: Save checkpoint based on validation accuracy ---
         # You could add logic here to save the model if it achieves the best validation accuracy seen so far.
@@ -258,154 +324,166 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
 
 
 # --- Evaluation Function ---
+# Modified to correctly collect info for processed samples using custom_collate_fn
 def evaluate_model(model, test_loader, device=DEVICE):
     """Evaluate model on the test set and calculate metrics."""
     model.eval() # Set model to evaluation mode
-    all_labels = []
-    all_preds = []
-    all_probs = []
-    # Collect test set image information for GradCAM etc.
-    test_image_info_collected = [] # Rename to be more explicit about collection
+    all_labels = [] # Ground truth labels for successfully processed samples
+    all_preds = [] # Predicted labels for successfully processed samples
+    all_probs = [] # Predicted probabilities for successfully processed samples
+    # Collect test set image information *during* evaluation loop, for successfully processed samples
+    test_image_info_collected = []
 
     print("Starting evaluation on test set...")
     with torch.no_grad(): # Disable gradient calculation
-        for batch_idx, (inputs, labels, img_infos_batch) in enumerate(test_loader):
-            # --- Add print statements here for debugging DataLoader output ---
-            # print(f"Evaluating Batch {batch_idx}:")
-            # print(f"  type(img_infos_batch): {type(img_infos_batch)}")
-            # if isinstance(img_infos_batch, (list, tuple)) and img_infos_batch:
-            #     print(f"  img_infos_batch length: {len(img_infos_batch)}")
-            #     print(f"  type(img_infos_batch[0]): {type(img_infos_batch[0])}")
-            #     if isinstance(img_infos_batch[0], dict):
-            #         print(f"  img_infos_batch[0] keys: {list(img_infos_batch[0].keys())}")
-            #     else:
-            #         print(f"  img_infos_batch[0] content: {img_infos_batch[0]}")
-            # elif img_infos_batch is not None:
-            #      print(f"  img_infos_batch content: {img_infos_batch}")
-            # else:
-            #     print("  img_infos_batch is None or empty")
-            # -------------------------------------------------------------
+        # test_loader now uses custom_collate_fn, returns (images_tensor, labels_tensor, infos_list_valid)
+        # where infos_list_valid contains infos ONLY for valid images in that batch
+        for batch_idx, (inputs, labels, img_infos_batch_valid) in enumerate(test_loader):
+
+            # Skip batch if no valid images were loaded
+            if inputs.size(0) == 0:
+                 # print(f"Warning: Skipping evaluation batch {batch_idx} with 0 valid images.")
+                 continue
 
             inputs = inputs.to(device)
-            labels = labels.to(device)
+            labels = labels.to(device) # These labels correspond to 'inputs'
 
             outputs = model(inputs)
             probs = torch.softmax(outputs, dim=1)
             _, preds = torch.max(outputs, 1)
 
+            # Extend lists only with data from successfully processed samples in this batch
             all_labels.extend(labels.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
             all_probs.extend(probs.cpu().numpy())
 
-            # --- Collect image information with type checking ---
-            # img_infos_batch returned by DataLoader for a batch is likely a list/tuple of items
-            if isinstance(img_infos_batch, (list, tuple)):
-                # Iterate through the batch of info items
-                for info_item in img_infos_batch:
-                    if isinstance(info_item, dict):
-                        # Only append if the item is a dictionary
-                        test_image_info_collected.append(info_item)
-                    else:
-                        # Print a warning if a non-dict item is found - this points to a potential DataLoader/Dataset issue
-                        print(f"Warning: Non-dictionary item found in img_infos from DataLoader (Batch {batch_idx}): type={type(info_item)}, content={info_item}. Skipping.")
-            elif isinstance(img_infos_batch, dict): # Handle batch_size=1 case where it might return a single dict
-                 test_image_info_collected.append(img_infos_batch)
-            else:
-                 # Print a warning if img_infos_batch is not a list/tuple/dict - indicates unexpected behavior
-                 print(f"Warning: Unexpected type for img_infos from DataLoader (Batch {batch_idx}): type={type(img_infos_batch)}. Skipping batch info.")
-            # ----------------------------------------------------
+            # Extend the info list with infos ONLY for the successfully processed samples in this batch
+            test_image_info_collected.extend(img_infos_batch_valid)
 
+    # After the loop, the lengths of all_labels, all_preds, all_probs, and test_image_info_collected
+    # should match the total number of samples successfully loaded and evaluated.
     all_labels = np.array(all_labels)
     all_preds = np.array(all_preds)
     all_probs = np.array(all_probs)
 
-    # --- Ensure the collected info list has the same length as labels/preds/probs ---
-    # This check helps catch issues where some info items might have been skipped or mismatched
+    # This check should now ideally show 0 mismatch if the custom_collate_fn works correctly
+    # and all samples in the DataLoader output are processed.
     if len(all_labels) != len(test_image_info_collected):
-        print(f"\nError: Mismatch between number of evaluated samples ({len(all_labels)}) and collected info items ({len(test_image_info_collected)}).")
-        print("This might cause issues in subsequent steps like Grad-CAM. Proceeding but be cautious.")
-        # You might need to investigate DataLoader/Dataset or multi-processing if this happens frequently.
-        # Consider setting NUM_WORKERS = 0 if it's a consistent issue.
-    # -----------------------------------------------------------------------------
-
+        # This indicates a severe issue if it still happens after custom collate_fn
+        print(f"\nSEVERE ERROR: Post-evaluation mismatch between number of evaluated samples ({len(all_labels)}) and collected info items ({len(test_image_info_collected)}).")
+        print("This indicates a fundamental issue in data loading/collection logic. Grad-CAM will likely fail or be unreliable.")
+        # import traceback
+        # traceback.print_exc() # Uncomment for detailed traceback here if needed
 
     print("\n--- Evaluation Results ---")
 
-    # Classification Report (Accuracy, Precision, Recall, F1-score)
-    report_str = classification_report(all_labels, all_preds, target_names=CLASSES)
-    print(report_str)
-    report_dict = classification_report(all_labels, all_preds, target_names=CLASSES, output_dict=True)
+    # Wrap evaluation metrics calculation and plotting in a try-except block
+    # to prevent crash if e.g., a class is missing in the test set results.
+    cm = np.array([]) # Initialize cm and report_dict before try block
+    report_dict = {}
+    try:
+        # Classification Report (Accuracy, Precision, Recall, F1-score)
+        # Ensure there are samples to evaluate
+        if len(all_labels) > 0:
+            report_str = classification_report(all_labels, all_preds, target_names=CLASSES)
+            print(report_str)
+            report_dict = classification_report(all_labels, all_preds, target_names=CLASSES, output_dict=True)
 
-    # Save classification report to file
-    report_file_path = os.path.join(OUTPUT_DIR, 'evaluation_report.txt')
-    with open(report_file_path, 'w') as f:
-        f.write("Classification Report:\n")
-        f.write(report_str)
-    print(f"Classification report saved to {report_file_path}")
+            # Save classification report to file
+            report_file_path = os.path.join(OUTPUT_DIR, 'evaluation_report.txt')
+            with open(report_file_path, 'w') as f:
+                f.write("Classification Report:\n")
+                f.write(report_str)
+            print(f"Classification report saved to {report_file_path}")
 
-    # Confusion Matrix
-    cm = confusion_matrix(all_labels, all_preds)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=CLASSES, yticklabels=CLASSES)
-    plt.xlabel('Predicted Label')
-    plt.ylabel('True Label')
-    plt.title('Confusion Matrix')
-    cm_path = os.path.join(OUTPUT_DIR, 'evaluation_plots', 'confusion_matrix.png')
-    plt.savefig(cm_path)
-    print(f"Confusion matrix saved to {cm_path}")
-    plt.close()
+            # Confusion Matrix
+            cm = confusion_matrix(all_labels, all_preds)
+            plt.figure(figsize=(8, 6))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=CLASSES, yticklabels=CLASSES)
+            plt.xlabel('Predicted Label')
+            plt.ylabel('True Label')
+            plt.title('Confusion Matrix')
+            cm_path = os.path.join(OUTPUT_DIR, 'evaluation_plots', 'confusion_matrix.png')
+            plt.savefig(cm_path)
+            print(f"Confusion matrix saved to {cm_path}")
+            plt.close()
 
-    # ROC Curve and AUC
-    plt.figure(figsize=(10, 8))
-    for i in range(len(CLASSES)):
-        # roc_curve needs (true_binary_labels, predicted_probabilities)
-        # true_binary_labels: Set current class to 1, others to 0
-        true_binary = (all_labels == i).astype(int)
-        # Handle cases where a class might not be present in test set
-        if np.sum(true_binary) > 0: # Only plot if the class is present in the test set
-            fpr, tpr, _ = roc_curve(true_binary, all_probs[:, i])
-            roc_auc = auc(fpr, tpr)
-            plt.plot(fpr, tpr, label=f'{CLASSES[i]} (AUC = {roc_auc:.2f})')
+            # ROC Curve and AUC
+            plt.figure(figsize=(10, 8))
+            # Check if there's more than one class present in true labels for ROC curve
+            if len(np.unique(all_labels)) > 1:
+                for i in range(len(CLASSES)):
+                    # roc_curve needs (true_binary_labels, predicted_probabilities)
+                    # true_binary_labels: Set current class to 1, others to 0
+                    true_binary = (all_labels == i).astype(int)
+                    # Handle cases where a class might not be present in true labels or has only one sample
+                    # roc_curve requires at least two samples with different true labels (0 and 1)
+                    unique_true_binary = np.unique(true_binary)
+                    if len(unique_true_binary) > 1:
+                        fpr, tpr, _ = roc_curve(true_binary, all_probs[:, i])
+                        roc_auc = auc(fpr, tpr)
+                        plt.plot(fpr, tpr, label=f'{CLASSES[i]} (AUC = {roc_auc:.2f})')
+                    else:
+                         # print(f"Warning: Class {CLASSES[i]} has only one true label type ({unique_true_binary[0]}) in test set results, cannot plot ROC curve.")
+                         pass # Keep printing cleaner if not critical
+
+                plt.plot([0, 1], [0, 1], 'k--') # Random guess line
+                plt.xlim([0.0, 1.0])
+                plt.ylim([0.0, 1.05])
+                plt.xlabel('False Positive Rate')
+                plt.ylabel('True Positive Rate')
+                plt.title('Receiver Operating Characteristic (ROC) Curve')
+                plt.legend(loc="lower right")
+                roc_path = os.path.join(OUTPUT_DIR, 'evaluation_plots', 'roc_curve.png')
+                plt.savefig(roc_path)
+                print(f"ROC curve saved to {roc_path}")
+                plt.close()
+            else:
+                print("Warning: Only one class present in test set true labels. Cannot plot ROC curve.")
+
+
+            # Precision-Recall Curve
+            plt.figure(figsize=(10, 8))
+            if len(np.unique(all_labels)) > 1: # PR curve also typically requires more than one class
+                for i in range(len(CLASSES)):
+                    # PrecisionRecallDisplay needs (true_binary_labels, predicted_probabilities_of_positive_class)
+                    true_binary = (all_labels == i).astype(int)
+                     # Handle cases where a class might not be present or has only one sample
+                    unique_true_binary = np.unique(true_binary)
+                    if len(unique_true_binary) > 1:
+                        # Use PrecisionRecallDisplay.from_predictions
+                        display = PrecisionRecallDisplay.from_predictions(true_binary, all_probs[:, i], name=CLASSES[i])
+                        display.plot(ax=plt.gca(), name=CLASSES[i]) # Plot onto the current axes
+                    else:
+                         # print(f"Warning: Class {CLASSES[i]} has only one true label type ({unique_true_binary[0]}) in test set results, cannot plot Precision-Recall curve.")
+                         pass
+
+
+                plt.title('Precision-Recall Curve')
+                plt.xlim([0.0, 1.0])
+                plt.ylim([0.0, 1.05])
+                plt.grid(True)
+                pr_curve_path = os.path.join(OUTPUT_DIR, 'evaluation_plots', 'precision_recall_curve.png')
+                plt.savefig(pr_curve_path)
+                print(f"Precision-Recall curve saved to {pr_curve_path}")
+                plt.close()
+            else:
+                 print("Warning: Only one class present in test set true labels. Cannot plot Precision-Recall curve.")
+
         else:
-             print(f"Warning: Class {CLASSES[i]} not present in test set, cannot plot ROC curve.")
+             print("No samples were successfully evaluated. Skipping evaluation metrics and plots.")
 
 
-    plt.plot([0, 1], [0, 1], 'k--') # Random guess line
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Receiver Operating Characteristic (ROC) Curve')
-    plt.legend(loc="lower right")
-    roc_path = os.path.join(OUTPUT_DIR, 'evaluation_plots', 'roc_curve.png')
-    plt.savefig(roc_path)
-    print(f"ROC curve saved to {roc_path}")
-    plt.close()
-
-    # Precision-Recall Curve
-    plt.figure(figsize=(10, 8))
-    for i in range(len(CLASSES)):
-        # PrecisionRecallDisplay needs (true_binary_labels, predicted_probabilities_of_positive_class)
-        true_binary = (all_labels == i).astype(int)
-         # Handle cases where a class might not be present in test set
-        if np.sum(true_binary) > 0: # Only plot if the class is present in the test set
-            display = PrecisionRecallDisplay.from_predictions(true_binary, all_probs[:, i], name=CLASSES[i])
-            display.plot(ax=plt.gca(), name=CLASSES[i]) # Plot onto the current axes
-        else:
-             print(f"Warning: Class {CLASSES[i]} not present in test set, cannot plot Precision-Recall curve.")
+    except Exception as e:
+        # If any error occurs during calculation or plotting
+        print(f"\nError encountered during evaluation metrics calculation or plotting: {e}")
+        import traceback
+        traceback.print_exc() # Print detailed error information
+        # cm and report_dict are already initialized with default values
+        print("Evaluation metrics calculation failed. Returning available data.")
 
 
-    plt.title('Precision-Recall Curve')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.grid(True)
-    pr_curve_path = os.path.join(OUTPUT_DIR, 'evaluation_plots', 'precision_recall_curve.png')
-    plt.savefig(pr_curve_path)
-    print(f"Precision-Recall curve saved to {pr_curve_path}")
-    plt.close()
-    # ------------------------------------
-
-    # Return the collected test_image_info_collected list
+    # Return the collected data for successfully processed samples
     return cm, report_dict, all_labels, all_preds, all_probs, test_image_info_collected
 
 # --- Grad-CAM Visualization (Simple Implementation) ---
@@ -417,7 +495,7 @@ class GradCAM:
         self.activations = None
         self.gradients = None
         self.model.eval() # Ensure model is in evaluation mode
-        self.hook_layers()
+        # Hooks will be registered before use in generate_heatmap
 
     def hook_layers(self):
         # Find the target layer by name and register forward/backward hooks
@@ -426,26 +504,33 @@ class GradCAM:
             if name == self.target_layer_name:
                 target_layer = module
                 # Register hooks
+                # Ensure hooks are removed before registering new ones if method is called multiple times
+                self.remove_hooks()
                 self.forward_hook_handle = target_layer.register_forward_hook(self._forward_hook)
                 self.backward_hook_handle = target_layer.register_backward_hook(self._backward_hook)
+                # print(f"Hooks registered for layer: {self.target_layer_name}") # Optional
                 break
 
         if target_layer is None:
             raise RuntimeError(f"Target layer '{self.target_layer_name}' not found in model.")
 
     def _forward_hook(self, module, input, output):
-        self.activations = output.cpu().data # Save activations of the target layer
+        # output is the output tensor of the layer
+        self.activations = output.cpu().data # Save activations
 
     def _backward_hook(self, module, grad_input, grad_output):
-        # grad_output is a tuple, we need the gradient with respect to the output of the layer
-        self.gradients = grad_output[0].cpu().data # Save gradients flowing into the target layer
+        # grad_output is a tuple (gradient w.r.t output, ...), we need the gradient w.r.t. the output
+        self.gradients = grad_output[0].cpu().data # Save gradients flowing into the layer
 
     def remove_hooks(self):
         # Remember to remove hooks after visualization to avoid memory leaks or interfering with other operations
-        if hasattr(self, 'forward_hook_handle'):
+        if hasattr(self, 'forward_hook_handle') and self.forward_hook_handle is not None:
              self.forward_hook_handle.remove()
-        if hasattr(self, 'backward_hook_handle'):
+             self.forward_hook_handle = None # Clear handle after removing
+        if hasattr(self, 'backward_hook_handle') and self.backward_hook_handle is not None:
              self.backward_hook_handle.remove()
+             self.backward_hook_handle = None # Clear handle after removing
+        # print("Grad-CAM hooks removed.") # Optional
 
 
     def generate_heatmap(self, input_image, target_class=None):
@@ -453,80 +538,112 @@ class GradCAM:
         Generate Grad-CAM heatmap for a single input image.
         input_image: torch.Tensor of shape (1, C, H, W), already normalized and on device.
         target_class: int, the class to generate heatmap for. If None, use model's prediction.
+        Returns: numpy array (H_resized, W_resized) heatmap scaled to [0, 1]
+                 or None if heatmap generation failed.
         """
         # Ensure model is on the correct device
         self.model.to(input_image.device)
         self.model.eval() # Ensure model is in evaluation mode
 
-        # Clear previous hooks just in case (defensive programming) and re-register
-        # This might not be strictly necessary if hooks are removed properly, but adds robustness
-        # try:
-        #      self.remove_hooks()
-        #      self.hook_layers() # Re-register hooks
-        # except RuntimeError as e:
-        #      print(f"Warning: Could not re-hook layers for Grad-CAM. {e}")
-        #      # Proceed with potentially old hooks or raise error depending on severity
+        # Register hooks before forward pass
+        try:
+             self.hook_layers()
+        except RuntimeError as e:
+             print(f"Error hooking layers for Grad-CAM: {e}")
+             return None # Cannot proceed without hooks
+
 
         # Copy image to keep original tensor detached from graph
         # Ensure input_image has requires_grad=True for backward pass
+        # This requires the input to the model have requires_grad=True.
+        # For a single image inference, we can clone and set requires_grad=True.
         if not input_image.requires_grad:
-             input_image_copy = input_image.clone().requires_grad_(True)
+             input_image_for_grad = input_image.clone().requires_grad_(True)
         else:
-             input_image_copy = input_image.clone() # If already requires_grad, just clone
-
-        # Forward pass
-        output = self.model(input_image_copy)
-
-        # Get predicted class if target_class is not specified
-        if target_class is None:
-            target_class = output.argmax(dim=1).item()
-
-        # Ensure target_class is valid for the model output dimension
-        if target_class < 0 or target_class >= output.size(1):
-             print(f"Warning: Invalid target_class {target_class} for output dimension {output.size(1)}. Using predicted class.")
-             target_class = output.argmax(dim=1).item() # Fallback to predicted class
+             input_image_for_grad = input_image.clone() # If already requires_grad, just clone
 
 
-        # Zero gradients for the model parameters
-        self.model.zero_grad()
+        try:
+            # Forward pass
+            output = self.model(input_image_for_grad)
 
-        # Compute gradient of the target class score with respect to model output
-        # Select the score for the target class from the output
-        target_score = output[0, target_class]
+            # Get predicted class if target_class is not specified
+            if target_class is None:
+                target_class = output.argmax(dim=1).item()
 
-        # Perform backward pass to get gradients
-        # retain_graph=True is needed if you want to do multiple backward passes on the same graph
-        # Here, we only do one per image, but better to keep it if the context might change
-        target_score.backward(retain_graph=True)
-
-
-        # Get gradients and activations from saved hook data
-        gradients = self.gradients # shape: (C_layer, H_layer, W_layer)
-        activations = self.activations # shape: (C_layer, H_layer, W_layer)
-
-        # Compute weights: Global Average Pooling of gradients over spatial dimensions
-        weights = torch.mean(gradients, dim=(1, 2), keepdim=True) # shape: (C_layer, 1, 1)
-
-        # Weighted sum of activations and apply ReLU
-        # Expand weights to match spatial dimensions of activations for element-wise multiplication
-        weighted_activations = weights * activations # Broadcast multiplication
-        heatmap = torch.sum(weighted_activations, dim=0) # Sum over channels to get shape: (H_layer, W_layer)
-        heatmap = torch.relu(heatmap) # Apply ReLU to the heatmap
-
-        # Normalize heatmap to [0, 1]
-        heatmap_max = torch.max(heatmap)
-        if heatmap_max > 0:
-             heatmap = heatmap / heatmap_max
-        else:
-             # Handle case where heatmap is all zeros (e.g., if gradients were zero)
-             heatmap = torch.zeros_like(heatmap)
+            # Ensure target_class is valid for the model output dimension
+            if target_class < 0 or target_class >= output.size(1):
+                 print(f"Warning: Invalid target_class {target_class} for output dimension {output.size(1)}. Using predicted class.")
+                 target_class = output.argmax(dim=1).item() # Fallback to predicted class
 
 
-        # Resize heatmap to the target image size (model input size IMG_SIZE)
-        heatmap_np = heatmap.detach().cpu().numpy() # Move to CPU and convert to numpy
-        heatmap_resized = cv2.resize(heatmap_np, IMG_SIZE) # Resize to model input size
+            # Zero gradients for the model parameters
+            # NOTE: We zero the gradients *before* backward pass for this specific sample
+            self.model.zero_grad()
 
-        return heatmap_resized
+            # Compute gradient of the target class score with respect to model output
+            # Select the score for the target class from the output
+            target_score = output[0, target_class]
+
+            # Perform backward pass to get gradients
+            # retain_graph=True is needed if you need the graph for further backward passes (e.g., for other samples in a batch, or multiple Grad-CAMs).
+            # Here, we do one sample at a time, but keeping retain_graph=True is safer if the context changes.
+            # However, if not needed, setting it to False saves memory. Let's keep it False for single image processing.
+            target_score.backward(retain_graph=False)
+
+
+            # Get gradients and activations from saved hook data
+            # Ensure activations and gradients were successfully saved by the hooks
+            if self.gradients is None or self.activations is None:
+                 print("Error: Gradients or Activations were not captured by hooks. Check target_layer_name.")
+                 return None # Return None if data wasn't captured
+
+            gradients = self.gradients # shape: (N, C_layer, H_layer, W_layer), N=1 for batch size 1
+            activations = self.activations # shape: (N, C_layer, H_layer, W_layer), N=1
+
+            # Remove the batch dimension (N=1)
+            gradients = gradients.squeeze(0) # shape: (C_layer, H_layer, W_layer)
+            activations = activations.squeeze(0) # shape: (C_layer, H_layer, W_layer)
+
+
+            # Compute weights: Global Average Pooling of gradients over spatial dimensions
+            # Mean over height and width for each channel
+            weights = torch.mean(gradients, dim=(1, 2), keepdim=True) # shape: (C_layer, 1, 1)
+
+            # Weighted sum of activations and apply ReLU
+            # Expand weights to match spatial dimensions of activations for element-wise multiplication
+            weighted_activations = weights * activations # Broadcast multiplication
+            heatmap = torch.sum(weighted_activations, dim=0) # Sum over channels to get shape: (H_layer, W_layer)
+            heatmap = torch.relu(heatmap) # Apply ReLU to the heatmap
+
+            # Normalize heatmap to [0, 1]
+            heatmap_max = torch.max(heatmap)
+            if heatmap_max > 0:
+                 heatmap = heatmap / heatmap_max
+            else:
+                 # Handle case where heatmap is all zeros (e.g., if gradients were zero or ReLU removed everything)
+                 heatmap = torch.zeros_like(heatmap)
+
+
+            # Resize heatmap to the target image size (model input size IMG_SIZE)
+            heatmap_np = heatmap.detach().cpu().numpy() # Move to CPU and convert to numpy
+            heatmap_resized = cv2.resize(heatmap_np, IMG_SIZE) # Resize to model input size
+
+            return heatmap_resized
+
+        except Exception as e:
+            print(f"Error generating Grad-CAM heatmap: {e}")
+            import traceback
+            traceback.print_exc()
+            return None # Return None if heatmap generation failed
+
+        finally:
+            # Ensure hooks are removed even if an error occurred during processing
+            self.remove_hooks()
+            # Clear saved gradients and activations to prevent issues in the next call
+            self.gradients = None
+            self.activations = None
+
 
     def save_gradcam_image(self, original_frame_path_saved, heatmap, predicted_class_str, true_class_str, img_info, save_path):
         """
@@ -537,43 +654,66 @@ class GradCAM:
         true_class_str: string of the true class.
         img_info: dict containing frame info (case_id, mode, frame_idx).
         save_path: Path to save the final superimposed image.
+        Returns True if successful, False otherwise.
         """
-        # Load the original saved extracted frame image
-        original_image = cv2.imread(original_frame_path_saved)
-        if original_image is None:
-            print(f"Error: Could not load image for Grad-CAM overlay: {original_frame_path_saved}")
-            return
+        if heatmap is None:
+             print(f"Error: Cannot save Grad-CAM image to {save_path} because heatmap generation failed.")
+             return False
 
-        original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB) # Convert to RGB
+        try:
+            # Load the original saved extracted frame image
+            original_image = cv2.imread(original_frame_path_saved)
+            if original_image is None:
+                print(f"Error: Could not load image for Grad-CAM overlay: {original_frame_path_saved}")
+                return False
 
-        # Resize original image to IMG_SIZE for overlay
-        original_image_resized = cv2.resize(original_image, IMG_SIZE)
+            original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB) # Convert to RGB
 
-        # Convert heatmap to a pseudo-colored image (Jet colormap)
-        heatmap_uint8 = np.uint8(255 * heatmap)
-        heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+            # Resize original image to IMG_SIZE for overlay
+            original_image_resized = cv2.resize(original_image, IMG_SIZE)
 
-        # Overlay heatmap on the resized original image using alpha blending
-        # Result = alpha * src1 + beta * src2 + gamma
-        superimposed_img = cv2.addWeighted(original_image_resized, 0.6, heatmap_colored, 0.4, 0)
-        superimposed_img = np.uint8(superimposed_img) # Ensure output is uint8
+            # Convert heatmap to a pseudo-colored image (Jet colormap)
+            heatmap_uint8 = np.uint8(255 * heatmap)
+            heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
 
-
-        # Add text labels for True/Predicted Class and Image Info
-        label_text = f"True: {true_class_str}, Pred: {predicted_class_str}"
-        info_text = f"Case: {img_info['case_id']}, Mode: {img_info['mode']}, Frame: {img_info['frame_idx']:03d}"
-        text_color = (255, 255, 255) # White color
-        # Add text with a simple black shadow for better visibility
-        cv2.putText(superimposed_img, label_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv2.LINE_AA) # Shadow
-        cv2.putText(superimposed_img, label_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2, cv2.LINE_AA)
-
-        cv2.putText(superimposed_img, info_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA) # Shadow
-        cv2.putText(superimposed_img, info_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1, cv2.LINE_AA)
+            # Overlay heatmap on the resized original image using alpha blending
+            # Result = alpha * src1 + beta * src2 + gamma
+            # Adjust alpha/beta values for desired transparency
+            superimposed_img = cv2.addWeighted(original_image_resized, 0.7, heatmap_colored, 0.3, 0)
+            superimposed_img = np.uint8(superimposed_img) # Ensure output is uint8
 
 
-        # Save the image
-        superimposed_img_bgr = cv2.cvtColor(superimposed_img, cv2.COLOR_RGB2BGR) # Convert back to BGR for saving with cv2.imwrite
-        cv2.imwrite(save_path, superimposed_img_bgr)
+            # Add text labels for True/Predicted Class and Image Info
+            label_text = f"True: {true_class_str}, Pred: {predicted_class_str}"
+            info_text = f"Case: {img_info['case_id']}, Mode: {img_info['mode']}, Frame: {img_info['frame_idx']:03d}"
+            text_color = (255, 255, 255) # White color
+            # Add text with a simple black shadow for better visibility
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.6
+            thickness = 2
+            shadow_thickness = thickness + 1
+            text_offset_y = 25 # Vertical spacing between lines
+            text_x = 10
+
+            # Text line 1: True/Pred
+            cv2.putText(superimposed_img, label_text, (text_x, text_offset_y), font, font_scale, (0, 0, 0), shadow_thickness, cv2.LINE_AA) # Shadow
+            cv2.putText(superimposed_img, label_text, (text_x, text_offset_y), font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+            # Text line 2: Info
+            cv2.putText(superimposed_img, info_text, (text_x, text_offset_y * 2), font, font_scale, (0, 0, 0), shadow_thickness, cv2.LINE_AA) # Shadow
+            cv2.putText(superimposed_img, info_text, (text_x, text_offset_y * 2), font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+
+            # Save the image
+            superimposed_img_bgr = cv2.cvtColor(superimposed_img, cv2.COLOR_RGB2BGR) # Convert back to BGR for saving with cv2.imwrite
+            cv2.imwrite(save_path, superimposed_img_bgr)
+            return True
+
+        except Exception as e:
+            print(f"Error saving Grad-CAM image {save_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
 
 # --- Main Execution Function ---
@@ -846,33 +986,77 @@ def main():
     unique_labels, label_counts = np.unique(labels_for_split, return_counts=True)
     min_samples_total = len(all_frame_info_list)
     # Calculate required minimum samples for stratified split in test/val set
-    min_test_size_needed = len(CLASSES) # Need at least 1 sample per class in test set
-    min_val_size_needed = len(CLASSES) # Need at least 1 sample per class in val set
+    min_test_size_needed = len(CLASSES) if len(unique_labels) == len(CLASSES) else 1 # Need at least 1 per class if all classes present, else at least 1
+    min_val_size_needed = len(CLASSES) if len(unique_labels) == len(CLASSES) else 1
 
+
+    # Determine test set size ensuring enough samples for stratification
+    # test_size should be at least min_test_size_needed
     test_size = max(min_test_size_needed, int(min_samples_total * (1 - TRAIN_VALID_SPLIT_RATIO)))
-    # Ensure test_size leaves enough for train_val
-    if test_size >= min_samples_total: test_size = max(min_test_size_needed, min_samples_total - max(min_val_size_needed, 1)) # Ensure train_val has at least 1 sample
+    # Adjust test_size if it's too large relative to total samples
+    if test_size >= min_samples_total:
+         # If test_size is >= total, make train_val have at least min_val_size_needed or 1, and test gets the rest
+         remaining_for_train_val = min_samples_total - max(min_val_size_needed, 1)
+         if remaining_for_train_val <= 0: # Cannot split if total is too small
+              print(f"Error: Total samples ({min_samples_total}) too small for split with {len(CLASSES)} classes and min requirements.")
+              return # Script terminates
+         test_size = min_samples_total - remaining_for_train_val
 
-    train_val_indices, test_indices, y_train_val, y_test_dummy = train_test_split(
-        indices, labels_for_split,
-        test_size=test_size,
-        stratify=labels_for_split,
-        random_state=RANDOM_SEED
-    )
+    # Perform the first split: Train+Validation vs Test
+    # Use stratify=labels_for_split only if all target classes are present in labels_for_split
+    stratify_labels = labels_for_split if len(unique_labels) == len(CLASSES) else None
+
+    if stratify_labels is not None:
+        train_val_indices, test_indices, y_train_val, y_test_dummy = train_test_split(
+            indices, labels_for_split,
+            test_size=test_size,
+            stratify=stratify_labels,
+            random_state=RANDOM_SEED
+        )
+    else:
+         print("Warning: Not all target classes present in dataset. Skipping stratification for first split.")
+         train_val_indices, test_indices, y_train_val, y_test_dummy = train_test_split(
+            indices, labels_for_split,
+            test_size=test_size,
+            # stratify=None, # No stratification
+            random_state=RANDOM_SEED
+        )
+
 
      # Second split: Train vs Validation
     train_val_samples_count = len(train_val_indices)
+    # Determine validation set size ensuring enough samples for stratification
+    # val_size should be at least min_val_size_needed
     val_size = max(min_val_size_needed, int(train_val_samples_count * VALID_TEST_SPLIT_RATIO))
-    # Ensure val_size leaves enough for train
-    if val_size >= train_val_samples_count: val_size = max(min_val_size_needed, train_val_samples_count - 1) # Ensure train has at least 1 sample
+    # Adjust val_size if it's too large relative to train_val samples
+    if val_size >= train_val_samples_count:
+        # If val_size is >= train_val count, train must have at least 1 sample
+        val_size = max(min_val_size_needed, train_val_samples_count - 1)
+        if val_size < min_val_size_needed:
+            print(f"Error: Train+Validation samples ({train_val_samples_count}) too small for split with {len(CLASSES)} classes and min requirements.")
+            return # Script terminates
 
 
-    train_indices, val_indices, y_train_dummy, y_val_dummy = train_test_split(
-        train_val_indices, y_train_val, # Stratify based on the labels of the train_val subset
-        test_size=val_size,
-        stratify=y_train_val,
-        random_state=RANDOM_SEED
-    )
+    # Use stratify=y_train_val only if all target classes are present in y_train_val
+    unique_labels_train_val = np.unique(y_train_val)
+    stratify_y_train_val = y_train_val if len(unique_labels_train_val) == len(CLASSES) else None
+
+    if stratify_y_train_val is not None:
+        train_indices, val_indices, y_train_dummy, y_val_dummy = train_test_split(
+            train_val_indices, y_train_val, # Stratify based on the labels of the train_val subset
+            test_size=val_size,
+            stratify=stratify_y_train_val,
+            random_state=RANDOM_SEED
+        )
+    else:
+         print("Warning: Not all target classes present in train+validation set. Skipping stratification for second split.")
+         train_indices, val_indices, y_train_dummy, y_val_dummy = train_test_split(
+            train_val_indices, y_train_val,
+            test_size=val_size,
+            # stratify=None, # No stratification
+            random_state=RANDOM_SEED
+        )
+
 
     # Reconstruct frame info lists based on indices
     train_frame_info = [all_frame_info_list[i] for i in train_indices]
@@ -917,38 +1101,41 @@ def main():
         # Randomly select one training image's info
         example_img_info = random.choice(train_frame_info)
         example_img_path = example_img_info['img_path']
-        original_img = Image.open(example_img_path).convert('RGB')
+        try:
+            original_img = Image.open(example_img_path).convert('RGB')
 
-        plt.figure(figsize=(12, 8))
-        plt.subplot(2, 3, 1)
-        plt.imshow(original_img)
-        plt.title('Original')
-        plt.axis('off')
-
-        # Apply data augmentation several times and display
-        for i in range(5):
-            # Create a fresh copy of the original image for each augmentation
-            augmented_img_tensor = data_transforms['train'](original_img.copy())
-            # ToTensor results in [0, 1], Normalize results in [-2, 2] approx
-            # For displaying: undo Normalize, then CHW to HWC
-            augmented_img_display = augmented_img_tensor.clone()
-            # Undo normalization: pixel_norm = (pixel_orig - mean) / std  => pixel_orig = pixel_norm * std + mean
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-            augmented_img_display = augmented_img_display * std + mean
-            # Clamp values to [0, 1] and convert CHW to HWC for display
-            augmented_img_display = np.clip(augmented_img_display.permute(1, 2, 0).numpy(), 0, 1)
-
-            plt.subplot(2, 3, i + 2)
-            plt.imshow(augmented_img_display)
-            plt.title(f'Augmented {i+1}')
+            plt.figure(figsize=(12, 8))
+            plt.subplot(2, 3, 1)
+            plt.imshow(original_img)
+            plt.title('Original')
             plt.axis('off')
 
-        augmentation_plot_path = os.path.join(OUTPUT_DIR, 'data_augmentation_examples.png')
-        plt.tight_layout()
-        plt.savefig(augmentation_plot_path)
-        print(f"Data augmentation examples saved to {augmentation_plot_path}")
-        plt.close()
+            # Apply data augmentation several times and display
+            for i in range(5):
+                # Create a fresh copy of the original image for each augmentation
+                augmented_img_tensor = data_transforms['train'](original_img.copy())
+                # ToTensor results in [0, 1], Normalize results in [-2, 2] approx
+                # For displaying: undo Normalize, then CHW to HWC
+                augmented_img_display = augmented_img_tensor.clone()
+                # Undo normalization: pixel_norm = (pixel_orig - mean) / std  => pixel_orig = pixel_norm * std + mean
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                augmented_img_display = augmented_img_display * std + mean
+                # Clamp values to [0, 1] and convert CHW to HWC for display
+                augmented_img_display = np.clip(augmented_img_display.permute(1, 2, 0).numpy(), 0, 1)
+
+                plt.subplot(2, 3, i + 2)
+                plt.imshow(augmented_img_display)
+                plt.title(f'Augmented {i+1}')
+                plt.axis('off')
+
+            augmentation_plot_path = os.path.join(OUTPUT_DIR, 'data_augmentation_examples.png')
+            plt.tight_layout()
+            plt.savefig(augmentation_plot_path)
+            print(f"Data augmentation examples saved to {augmentation_plot_path}")
+            plt.close()
+        except Exception as e:
+             print(f"Warning: Could not generate data augmentation examples from {example_img_path}. Error: {e}")
     else:
         print("No training data available to show augmentation examples.")
 
@@ -959,9 +1146,10 @@ def main():
     test_dataset = ColonoscopyFrameDataset(test_frame_info, transform=data_transforms['test'])
 
     # Set shuffle=False for val and test loaders to ensure consistent order for evaluation
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    # *** Use custom_collate_fn for all DataLoaders ***
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True, collate_fn=custom_collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, collate_fn=custom_collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, collate_fn=custom_collate_fn)
 
     # 7. Build Model
     print("\nBuilding model...")
@@ -978,34 +1166,38 @@ def main():
 
     # --- 图片输出 4: Training Plot ---
     print("Saving training plot...")
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1)
-    plt.plot(range(NUM_EPOCHS), train_losses, label='Train Loss')
-    plt.plot(range(NUM_EPOCHS), val_losses, label='Validation Loss')
-    plt.title('Training and Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
+    if NUM_EPOCHS > 0 and (train_losses or val_losses): # Only plot if training ran for at least one epoch
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(range(NUM_EPOCHS), train_losses, label='Train Loss')
+        plt.plot(range(NUM_EPOCHS), val_losses, label='Validation Loss')
+        plt.title('Training and Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
 
-    plt.subplot(1, 2, 2)
-    plt.plot(range(NUM_EPOCHS), train_accs, label='Train Accuracy')
-    plt.plot(range(NUM_EPOCHS), val_accs, label='Validation Accuracy')
-    plt.title('Training and Validation Accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.legend()
-    plt.grid(True)
+        plt.subplot(1, 2, 2)
+        plt.plot(range(NUM_EPOCHS), train_accs, label='Train Accuracy')
+        plt.plot(range(NUM_EPOCHS), val_accs, label='Validation Accuracy')
+        plt.title('Training and Validation Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.legend()
+        plt.grid(True)
 
-    training_plot_path = os.path.join(OUTPUT_DIR, 'training_plot.png')
-    plt.tight_layout()
-    plt.savefig(training_plot_path)
-    print(f"Training plot saved to {training_plot_path}")
-    plt.close()
+        training_plot_path = os.path.join(OUTPUT_DIR, 'training_plot.png')
+        plt.tight_layout()
+        plt.savefig(training_plot_path)
+        print(f"Training plot saved to {training_plot_path}")
+        plt.close()
+    else:
+        print("Skipping training plot: No epochs were trained.")
+
 
     # 9. Evaluate Model and Output Images
     print("\nEvaluating model on test set...")
-    # evaluate_model now returns test_image_info
+    # evaluate_model now returns data only for successfully processed samples
     cm, report_dict, all_labels, all_preds, all_probs, test_image_info_evaluated = evaluate_model(model_trained, test_loader, device=DEVICE)
     # confusion matrix, ROC curve, and Precision-Recall curve are saved within evaluate_model function
 
@@ -1022,124 +1214,149 @@ def main():
     gradcam_target_layer = 'layer4' # Default guess for ResNet, CHANGE THIS IF NECESSARY based on print(model_trained)!
     # ------------------------------------------------------------------------------------------
 
-    if gradcam_target_layer and test_image_info_evaluated: # Use test_image_info_evaluated from evaluate_model
+    # Proceed with Grad-CAM only if evaluation was successful (samples processed)
+    # and the number of samples matches the collected info items.
+    if gradcam_target_layer and len(all_labels) > 0 and len(all_labels) == len(test_image_info_evaluated):
         try:
             print(f"Attempting Grad-CAM with target layer: '{gradcam_target_layer}'")
+            # Initialize GradCAM object (hooks are registered later just before use)
             grad_cam = GradCAM(model_trained, gradcam_target_layer)
 
             # Select samples from the test set for visualization
             num_gradcam_examples_per_status = 3 # Save this many correct/incorrect examples per class
 
-            # Collect test set sample indices by their true label and prediction status
+            # Collect indices of successfully evaluated test samples by their true label and prediction status
             test_sample_indices_by_class_status = {cls: {'correct': [], 'incorrect': []} for cls in CLASSES}
 
-            # Iterate through the collected info list and align with all_preds
-            # Assumes test_image_info_evaluated and all_preds have the same order and length
-            if len(test_image_info_evaluated) != len(all_preds):
-                 print("\nError: Mismatch between collected info items and predictions. Skipping Grad-CAM.")
-            else:
-                for i in range(len(test_image_info_evaluated)):
-                    img_info = test_image_info_evaluated[i]
-                    # Ensure img_info is indeed a dictionary and has the expected keys
-                    if isinstance(img_info, dict) and 'label_str' in img_info and 'label' in img_info:
-                        true_label_str = img_info['label_str']
-                        # true_label_idx = img_info['label'] # Not strictly needed for selection logic here
-                        predicted_label_idx = all_preds[i] # Get prediction from the all_preds list which aligns with test_image_info_evaluated
-                        predicted_label_str = IDX_TO_CLASS[predicted_label_idx]
+            # Iterate through the collected info list (which now matches the prediction lists)
+            # and categorize sample indices.
+            for i in range(len(test_image_info_evaluated)):
+                img_info = test_image_info_evaluated[i]
+                true_label_idx = img_info['label'] # Use label from the info dict
+                # Ensure the true label index is valid and map to string
+                if true_label_idx not in IDX_TO_CLASS:
+                     print(f"Warning: Skipping sample index {i} for Grad-CAM categorization due to invalid true label index: {true_label_idx}")
+                     continue
+                true_label_str = IDX_TO_CLASS[true_label_idx]
 
-                        status = 'correct' if img_info['label'] == predicted_label_idx else 'incorrect'
-                        # Ensure the class is in our target CLASSES
-                        if true_label_str in CLASSES:
-                            test_sample_indices_by_class_status[true_label_str][status].append(i) # Append index 'i' from test_image_info_evaluated
-                    else:
-                         print(f"Warning: Skipping Grad-CAM selection for item at index {i} due to unexpected info format: {img_info}")
+                predicted_label_idx = all_preds[i] # Get prediction from the all_preds list which aligns with test_image_info_evaluated
+
+                status = 'correct' if true_label_idx == predicted_label_idx else 'incorrect'
+
+                # Ensure the true class is in our target CLASSES
+                if true_label_str in CLASSES:
+                    test_sample_indices_by_class_status[true_label_str][status].append(i) # Append index 'i' from test_image_info_evaluated
 
 
-                gradcam_count_saved = {cls: {'correct': 0, 'incorrect': 0} for cls in CLASSES}
+            gradcam_count_saved = {cls: {'correct': 0, 'incorrect': 0} for cls in CLASSES}
 
-                print("Selecting and generating samples for Grad-CAM...")
-                # Iterate through each class and each status (correct/incorrect)
-                for cls in CLASSES:
-                    for status in ['correct', 'incorrect']:
-                        indices_pool = test_sample_indices_by_class_status[cls][status]
-                        num_samples_to_save = min(len(indices_pool), num_gradcam_examples_per_status)
-                        if num_samples_to_save == 0:
-                             # print(f"No {status} samples found for class {cls} in test set.") # Optional
+            print("Selecting and generating samples for Grad-CAM...")
+            # Iterate through each class and each status (correct/incorrect)
+            for cls in CLASSES:
+                for status in ['correct', 'incorrect']:
+                    indices_pool = test_sample_indices_by_class_status[cls][status]
+                    num_samples_to_save = min(len(indices_pool), num_gradcam_examples_per_status)
+                    if num_samples_to_save == 0:
+                         # print(f"No {status} samples found for class {cls} in successfully evaluated set.") # Optional
+                         continue
+
+                    # Randomly sample indices from the pool
+                    selected_indices = random.sample(indices_pool, num_samples_to_save)
+
+                    print(f"Generating {num_samples_to_save} Grad-CAM examples for Class: {cls}, Status: {status}...")
+
+                    for i in selected_indices: # 'i' here is the index within test_image_info_evaluated (and all_preds, all_labels)
+                        img_info = test_image_info_evaluated[i] # Retrieve the info dictionary
+
+                        # Double check img_info validity before proceeding (should be ok now with collected list)
+                        if not (isinstance(img_info, dict) and 'img_path' in img_info and 'label_str' in img_info and 'case_id' in img_info and 'mode' in img_info and 'frame_idx' in img_info):
+                             print(f"Warning: Skipping Grad-CAM generation for item at index {i} due to invalid info format: {img_info}")
                              continue
 
-                        # Randomly sample indices from the pool
-                        selected_indices = random.sample(indices_pool, num_samples_to_save)
 
+                        true_label_str = img_info['label_str']
+                        predicted_label_idx = all_preds[i] # Use the prediction corresponding to this index 'i'
+                        predicted_label_str = IDX_TO_CLASS[predicted_label_idx]
 
-                        for i in selected_indices: # 'i' here is the index within test_image_info_evaluated
-                            img_info = test_image_info_evaluated[i] # Retrieve the info dictionary
+                        # Path to the saved extracted frame image
+                        img_path_saved = img_info['img_path']
 
-                            # Double check img_info validity before proceeding
-                            if not (isinstance(img_info, dict) and 'img_path' in img_info and 'label_str' in img_info and 'case_id' in img_info and 'mode' in img_info and 'frame_idx' in img_info):
-                                 print(f"Warning: Skipping Grad-CAM generation for item at index {i} due to invalid info format: {img_info}")
-                                 continue # Skip this item
+                        # Load the image and apply the test transform to get the tensor input for the model
+                        # This step is repeated because Grad-CAM needs the raw image data and a tensor with requires_grad=True
+                        # It's safer to reload and re-transform for Grad-CAM specifically.
+                        try:
+                            img_pil = Image.open(img_path_saved).convert('RGB')
+                            if img_pil is None:
+                                print(f"Warning: Could not load image {img_path_saved} for Grad-CAM transformation.")
+                                continue
+                            # Apply the test transform
+                            input_tensor = data_transforms['test'](img_pil)
+                            # Add batch dimension and move to device
+                            input_tensor = input_tensor.unsqueeze(0).to(DEVICE)
+                             # print(f"Successfully loaded and transformed {img_path_saved} for Grad-CAM.") # Debugging
+                        except Exception as e:
+                             print(f"Warning: Error loading or transforming image {img_path_saved} for Grad-CAM. {e}")
+                             continue # Skip this sample for Grad-CAM
 
+                        # Generate Grad-CAM heatmap for the predicted class of this sample
+                        try:
+                           # Pass the predicted class as the target class for visualization
+                           heatmap = grad_cam.generate_heatmap(input_tensor, target_class=predicted_label_idx)
+                           if heatmap is None:
+                               print(f"Warning: Heatmap generation failed for {img_path_saved}. Skipping.")
+                               continue # Skip this sample if heatmap failed
+                           # print(f"Successfully generated heatmap for {img_path_saved}.") # Debugging
+                        except Exception as e:
+                           print(f"Warning: Error generating heatmap for {img_path_saved}. {e}")
+                           import traceback
+                           traceback.print_exc()
+                           continue # Skip this sample if heatmap generation failed
 
-                            true_label_str = img_info['label_str']
-                            predicted_label_idx = all_preds[i] # Use the prediction corresponding to this index 'i'
-                            predicted_label_str = IDX_TO_CLASS[predicted_label_idx]
+                        # Save the superimposed image
+                        # Filename: TrueClass_PredClass_CaseID_Mode_frameXXX_gradcam.jpg
+                        img_save_name = f"True{true_label_str}_Pred{predicted_label_str}_{img_info['case_id']}_{img_info['mode']}_frame{img_info['frame_idx']:03d}_gradcam.jpg"
+                        save_path = os.path.join(OUTPUT_DIR, 'grad_cam', img_save_name)
 
-                            # Path to the saved extracted frame image
-                            img_path_saved = img_info['img_path']
-
-                            # Load the image and apply the test transform to get the tensor input for the model
-                            try:
-                                img_pil = Image.open(img_path_saved).convert('RGB')
-                                if img_pil is None:
-                                    print(f"Warning: Could not load image {img_path_saved} for Grad-CAM transformation.")
-                                    continue
-                                input_tensor = data_transforms['test'](img_pil).unsqueeze(0).to(DEVICE) # Add batch dimension and move to device
-                            except Exception as e:
-                                 print(f"Warning: Error loading or transforming image {img_path_saved} for Grad-CAM. {e}")
-                                 continue
-
-                            # Generate Grad-CAM heatmap for the predicted class of this sample
-                            try:
-                               heatmap = grad_cam.generate_heatmap(input_tensor, target_class=predicted_label_idx) # Use the actual predicted class
-                            except Exception as e:
-                               print(f"Warning: Error generating heatmap for {img_path_saved}. {e}")
-                               continue
-
-                            # Save the superimposed image
-                            # Filename: TrueClass_PredClass_CaseID_Mode_frameXXX_gradcam.jpg
-                            img_save_name = f"True{true_label_str}_Pred{predicted_label_str}_{img_info['case_id']}_{img_info['mode']}_frame{img_info['frame_idx']:03d}_gradcam.jpg"
-                            save_path = os.path.join(OUTPUT_DIR, 'grad_cam', img_save_name)
-
-                            # save_gradcam_image needs the path to the saved extracted frame, heatmap,
-                            # predicted and true labels strings, and the img_info dictionary.
-                            try:
-                                grad_cam.save_gradcam_image(img_path_saved, heatmap, predicted_label_str, true_label_str, img_info, save_path)
+                        # save_gradcam_image needs the path to the saved extracted frame, heatmap,
+                        # predicted and true labels strings, and the img_info dictionary.
+                        try:
+                            success = grad_cam.save_gradcam_image(img_path_saved, heatmap, predicted_label_str, true_label_str, img_info, save_path)
+                            if success:
                                 # print(f"Saved Grad-CAM for {img_save_name}") # Optional: too verbose
                                 gradcam_count_saved[true_label_str][status] += 1
-                            except Exception as e:
-                                 print(f"Warning: Error saving Grad-CAM image {save_path}. {e}")
+                        except Exception as e:
+                             print(f"Warning: Error saving Grad-CAM image {save_path}. {e}")
 
-                print(f"Finished selecting and generating Grad-CAM for class {cls}, status {status}.")
 
-            print("Grad-CAM visualizations generated.")
-            # --- Remember to remove hooks after visualization ---
-            try:
-                 grad_cam.remove_hooks()
-                 print("Grad-CAM hooks removed.")
-            except Exception as e:
-                 print(f"Warning: Error removing Grad-CAM hooks. {e}")
-            # --------------------------------------------------
+            print(f"Finished generating Grad-CAM for all selected samples.")
 
 
         except RuntimeError as e:
              print(f"\nGrad-CAM Runtime Error: {e}")
              print(f"Please check if the 'gradcam_target_layer = '{gradcam_target_layer}' ' setting in the script is correct for your chosen model ('{MODEL_NAME}').")
-             print("You might need to inspect your model structure (e.g., by adding 'print(model_trained)' after model building) to find the correct layer name.")
              # print(model_trained) # Uncomment this line to print model structure
         except Exception as e:
             print(f"\nAn unexpected error occurred during Grad-CAM visualization: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+             # Ensure hooks are removed after the entire Grad-CAM process is done
+             if 'grad_cam' in locals() and grad_cam is not None:
+                 try:
+                      grad_cam.remove_hooks()
+                      # print("Final Grad-CAM hooks cleanup done.") # Optional
+                 except Exception as e:
+                      print(f"Warning: Error during final Grad-CAM hooks cleanup. {e}")
+
+    else:
+        if not gradcam_target_layer:
+            print("\nSkipping Grad-CAM: gradcam_target_layer is not set.")
+        elif len(all_labels) == 0:
+            print("\nSkipping Grad-CAM: No samples were successfully evaluated.")
+        elif len(all_labels) != len(test_image_info_evaluated):
+             print(f"\nSkipping Grad-CAM: Mismatch between number of evaluated samples ({len(all_labels)}) and collected info items ({len(test_image_info_evaluated)}).")
+             print("Please fix the data loading/info collection issue.")
+
 
     # 11. Clean up extracted frames (Optional)
     # print(f"\nCleaning up extracted frames directory: {frames_save_dir}")
