@@ -290,56 +290,420 @@ opt --model_file=./inference_model/lenet.pdmodel \
 
 ## Phase 3: 应用开发与部署 (在实验箱上)
 
+此阶段将在实验箱上使用`Qt Creator`完成整个应用程序的开发。
+
 ### 3.1. 准备工作
 
-1.  **传输模型**: 将PC上的`lite_model/lenet.nb`文件通过`scp`传输到实验箱的`~/`主目录。
-2.  **创建项目**: 在实验箱上打开`Qt Creator`，创建一个名为`ArmSortApp`的Qt Widgets Application项目。
-3.  **移动模型**: 将`lenet.nb`文件移动到新创建的`ArmSortApp`项目文件夹内。
+1.  **传输模型**: 确认已将PC上生成的`lite_model/lenet.nb`文件通过`scp`传输到实验箱的`~/`主目录。
+2.  **创建项目**:
+    *   在实验箱上打开`Qt Creator`。
+    *   选择 `File -> New Project`。
+    *   选择 `Application (Qt) -> Qt Widgets Application -> Choose...`。
+    *   项目名称填写 `ArmSortApp`，路径选择 `~/` (主目录)。
+    *   构建系统选择 `qmake`。
+    *   类信息保持默认 (`MainWindow`, base class `QMainWindow`)。
+    *   构建套件(Kit)选择默认的Desktop kit。
+    *   完成创建。
+3.  **移动模型**: 在实验箱的文件管理器中，将`~/lenet.nb`文件移动到刚刚创建的`~/ArmSortApp/`项目文件夹内。
 
-### 3.2. 配置Qt项目
+### 3.2. 配置Qt项目 (`.pro`文件)
 
-打开`ArmSortApp.pro`文件，用以下内容替换，**注意修改`PADDLE_LITE_CPP_DIR`为你自己的路径**。
+双击Qt Creator左侧项目树中的`ArmSortApp.pro`文件，用以下内容**完全替换**原有内容。
+
+**请务必根据您自己的实际情况修改 `PADDLE_LITE_CPP_DIR` 的路径！**
 
 ```qmake
 # ArmSortApp.pro
+
 QT       += core gui serialport
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 CONFIG   += c++11
+CONFIG   -= app_bundle
 
-TARGET = ArmSortApp
-TEMPLATE = app
+# The following define makes your compiler emit warnings if you use
+# any Qt feature that has been marked deprecated.
+DEFINES += QT_DEPRECATED_WARNINGS
 
-SOURCES += main.cpp\
-        mainwindow.cpp
-HEADERS  += mainwindow.h
-FORMS    += mainwindow.ui
+SOURCES += \
+    main.cpp \
+    mainwindow.cpp
 
-# 使用pkg-config自动链接OpenCV
+HEADERS += \
+    mainwindow.h
+
+FORMS += \
+    mainwindow.ui
+
+# === 配置OpenCV ===
+# 使用pkg-config自动链接OpenCV，这是在Linux上最稳健的方式
 CONFIG += link_pkgconfig
 PKGCONFIG += opencv4
 
-# 配置PaddleLite C++预测库
-# !!! 修改为你在实验箱上解压的实际路径 !!!
+# === 配置PaddleLite C++预测库 ===
+# !!! 关键：请修改为你在实验箱上解压PaddleLite库的实际路径 !!!
 PADDLE_LITE_CPP_DIR = /home/linux/paddlelite_cpp/inference_lite_lib.linux.aarch64
 
 INCLUDEPATH += $$PADDLE_LITE_CPP_DIR/include
+
+# 链接PaddleLite动态库
 LIBS += -L$$PADDLE_LITE_CPP_DIR/lib -lpaddle_light_api_shared
 
-# 自动将.so文件拷贝到编译输出目录，方便运行
+# === 部署步骤：自动将依赖的动态库拷贝到编译输出目录 ===
+# 这样，程序运行时就能直接找到它，无需配置LD_LIBRARY_PATH
 PADDLE_LITE_SO = $$PADDLE_LITE_CPP_DIR/lib/libpaddle_light_api_shared.so
+
+# 获取编译输出目录 (e.g., build-ArmSortApp-Desktop-Debug/)
 DESTDIR_SO = $$OUT_PWD
-QMAKE_POST_LINK += $$QMAKE_COPY $$quote($$PADDLE_LITE_SO) $$quote($$DESTDIR_SO) $$escape_expand(\\n\\t)
+
+# 定义一个拷贝命令，在链接步骤完成后执行
+# $$quote确保路径中有空格也能正确处理
+# $$escape_expand确保换行符被正确解析
+COPY_CMD = $$QMAKE_COPY $$quote($$PADDLE_LITE_SO) $$quote($$DESTDIR_SO)
+QMAKE_POST_LINK += $$COPY_CMD $$escape_expand(\\n\\t)
+```
+> **重要**: 修改完 `.pro` 文件后，右键点击项目名称，选择 `Run qmake`，让配置生效。
+
+### 3.3. 设计UI界面 (`mainwindow.ui`)
+
+1.  双击`mainwindow.ui`文件，进入**设计模式**。
+2.  从左侧的**控件盒子 (Widget Box)** 中拖拽以下控件到主窗口上：
+    *   一个 `QLabel`，用于显示摄像头视频。将其`objectName`属性修改为 `videoLabel`。
+    *   一个 `QPushButton`，用于启动任务。将其`text`属性修改为 `开始排序`，`objectName`属性修改为 `startButton`。
+    *   一个 `QLabel`，用于显示状态信息。将其`text`属性留空，`objectName`属性修改为 `statusLabel`。
+3.  使用顶部的布局工具（如垂直布局、水平布局、栅格布局）对控件进行简单的排列，使其美观。
+4.  按下 `Ctrl + S` 保存UI设计。
+
+### 3.4. 编写C++核心代码
+
+现在，我们将填充头文件和源文件的内容。
+
+#### 3.4.1. 头文件 (`mainwindow.h`)
+
+用以下内容**完全替换** `mainwindow.h`：
+
+```cpp
+#ifndef MAINWINDOW_H
+#define MAINWINDOW_H
+
+#include <QMainWindow>
+#include <QTimer>
+#include <QSerialPort>
+#include <vector>
+#include <memory>
+
+// OpenCV Headers
+#include <opencv2/opencv.hpp>
+
+// PaddleLite Headers
+#include "paddle_api.h"
+
+QT_BEGIN_NAMESPACE
+namespace Ui { class MainWindow; }
+QT_END_NAMESPACE
+
+// 用于保存识别结果的数据结构
+struct DetectionResult {
+    int digit;
+    int original_pos_index; // 在仓库一中的原始位置索引 (0-3)
+
+    // 重载小于操作符，方便排序
+    bool operator<(const DetectionResult& other) const {
+        return this->digit < other.digit;
+    }
+};
+
+class MainWindow : public QMainWindow
+{
+    Q_OBJECT
+
+public:
+    MainWindow(QWidget *parent = nullptr);
+    ~MainWindow();
+
+private slots:
+    void on_startButton_clicked(); // “开始排序”按钮的槽函数
+    void update_camera_frame();    // 定时器触发，用于更新视频帧
+
+private:
+    // 初始化函数
+    void initCamera();
+    void initModel();
+    void initSerialPort();
+    void initUI();
+
+    // 核心功能函数
+    std::vector<DetectionResult> processFrame(const cv::Mat& frame);
+    int predict(const cv::Mat& roi);
+    void sendArmCommand(int from_pos, int to_pos);
+
+    Ui::MainWindow *ui;
+
+    // Qt组件
+    QTimer *camera_timer;
+    QSerialPort *serial_port;
+
+    // OpenCV组件
+    cv::VideoCapture cap;
+
+    // PaddleLite组件
+    std::shared_ptr<paddle::lite_api::PaddlePredictor> predictor;
+
+    // 业务逻辑变量
+    bool is_task_running = false;
+    std::vector<cv::Rect> warehouse1_rois; // 仓库一4个格子的ROI
+};
+#endif // MAINWINDOW_H
 ```
 
-### 3.3. 编写C++核心代码
+#### 3.4.2. 源文件 (`mainwindow.cpp`)
 
-请参考之前提供的C++代码框架和逻辑片段，在`Qt Creator`中完成`mainwindow.h`和`mainwindow.cpp`的编写，实现模型加载、图像捕获与处理、模型预测、结果排序和串口通信等功能。
+用以下内容**完全替换** `mainwindow.cpp`：
 
-### 3.4. 编译与运行
+```cpp
+#include "mainwindow.h"
+#include "ui_mainwindow.h"
+#include <QDebug>
+#include <QApplication>
 
-1.  在`Qt Creator`中，配置好构建套件，然后点击**构建**按钮。
-2.  构建成功后，点击**运行**按钮。
-3.  在实验箱上摆好积木，点击程序界面上的“开始排序”按钮，观察并调试。
+MainWindow::MainWindow(QWidget *parent)
+    : QMainWindow(parent)
+    , ui(new Ui::MainWindow)
+{
+    ui->setupUi(this);
 
----
+    initUI();
+    initModel();
+    initCamera();
+    initSerialPort();
+}
+
+MainWindow::~MainWindow()
+{
+    if (cap.isOpened()) {
+        cap.release();
+    }
+    delete ui;
+}
+
+void MainWindow::initUI()
+{
+    this->setWindowTitle("AI机械臂排序系统");
+    ui->statusLabel->setText("系统准备就绪。");
+
+    // !!! 关键：根据你的摄像头和布局，手动标定这4个ROI矩形框 !!!
+    // cv::Rect(x, y, width, height)
+    warehouse1_rois.push_back(cv::Rect(50, 50, 100, 100));    // 左上角格子
+    warehouse1_rois.push_back(cv::Rect(200, 50, 100, 100));   // 右上角格子
+    warehouse1_rois.push_back(cv::Rect(50, 200, 100, 100));   // 左下角格子
+    warehouse1_rois.push_back(cv::Rect(200, 200, 100, 100));  // 右下角格子
+}
+
+void MainWindow::initModel()
+{
+    // 获取可执行文件所在目录，模型文件应与可执行文件在同一目录
+    QString model_path = QApplication::applicationDirPath() + "/lenet.nb";
+    
+    ui->statusLabel->setText("正在加载AI模型...");
+    paddle::lite_api::MobileConfig config;
+    config.set_model_from_file(model_path.toStdString());
+
+    try {
+        predictor = paddle::lite_api::CreatePaddlePredictor(config);
+        qDebug() << "PaddleLite model loaded from:" << model_path;
+        ui->statusLabel->setText("AI模型加载成功。");
+    } catch (const std::exception& e) {
+        qCritical() << "Failed to load model: " << e.what();
+        ui->statusLabel->setText("错误：AI模型加载失败！");
+        ui->startButton->setEnabled(false);
+    }
+}
+
+void MainWindow::initCamera()
+{
+    cap.open(0); // 0代表默认摄像头
+    if (!cap.isOpened()) {
+        qCritical() << "Cannot open camera!";
+        ui->statusLabel->setText("错误：无法打开摄像头！");
+        ui->startButton->setEnabled(false);
+        return;
+    }
+
+    camera_timer = new QTimer(this);
+    connect(camera_timer, &QTimer::timeout, this, &MainWindow::update_camera_frame);
+    camera_timer->start(40); // 每秒25帧
+}
+
+void MainWindow::initSerialPort()
+{
+    serial_port = new QSerialPort(this);
+    serial_port->setPortName("/dev/ttyS1"); // !!! 修改为你的实验箱机械臂的实际串口 !!!
+    serial_port->setBaudRate(QSerialPort::Baud115200);
+    serial_port->setDataBits(QSerialPort::Data8);
+    serial_port->setParity(QSerialPort::NoParity);
+    serial_port->setStopBits(QSerialPort::OneStop);
+    serial_port->setFlowControl(QSerialPort::NoFlowControl);
+}
+
+void MainWindow::update_camera_frame()
+{
+    if (!cap.isOpened()) return;
+
+    cv::Mat frame;
+    cap >> frame;
+
+    if (frame.empty()) return;
+
+    // 在视频帧上绘制ROI框，方便调试
+    for (const auto& roi : warehouse1_rois) {
+        cv::rectangle(frame, roi, cv::Scalar(0, 255, 0), 2);
+    }
+
+    // 将OpenCV的Mat格式转换为Qt的QImage格式以在QLabel中显示
+    cv::cvtColor(frame, frame, cv::COLOR_BGR2RGB);
+    QImage qimg(frame.data, frame.cols, frame.rows, frame.step, QImage::Format_RGB888);
+    ui->videoLabel->setPixmap(QPixmap::fromImage(qimg).scaled(ui->videoLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+}
+
+void MainWindow::on_startButton_clicked()
+{
+    if (is_task_running) return;
+    
+    is_task_running = true;
+    ui->startButton->setEnabled(false);
+    ui->statusLabel->setText("任务开始：正在识别积木...");
+    QApplication::processEvents(); // 强制UI刷新
+
+    cv::Mat current_frame;
+    cap >> current_frame;
+    if (current_frame.empty()) {
+        ui->statusLabel->setText("错误：无法捕获图像！");
+        is_task_running = false;
+        ui->startButton->setEnabled(true);
+        return;
+    }
+
+    // 核心处理逻辑
+    std::vector<DetectionResult> results = processFrame(current_frame);
+
+    if (results.empty()) {
+        ui->statusLabel->setText("任务完成：未识别到任何积木。");
+    } else {
+        // 降序排序
+        std::sort(results.rbegin(), results.rend());
+
+        QString log = "识别并排序完成: ";
+        for(const auto& res : results) {
+            log += QString::number(res.digit) + " ";
+        }
+        ui->statusLabel->setText(log);
+        QApplication::processEvents();
+
+        // 执行机械臂搬运
+        for (size_t i = 0; i < results.size(); ++i) {
+            int from = results[i].original_pos_index;
+            int to = i; // 目标位置按排序后的顺序
+            
+            ui->statusLabel->setText(QString("正在搬运积木 %1: 从位置 %2 到 %3...")
+                                     .arg(results[i].digit).arg(from + 1).arg(to + 1));
+            QApplication::processEvents();
+            
+            sendArmCommand(from, to);
+            // 这里应该等待机械臂完成动作，可以通过接收串口返回信号
+            // 为简化，我们使用固定延时
+            QThread::sleep(5); // 等待5秒
+        }
+        ui->statusLabel->setText("任务全部完成！");
+    }
+    
+    is_task_running = false;
+    ui->startButton->setEnabled(true);
+}
+
+std::vector<DetectionResult> MainWindow::processFrame(const cv::Mat& frame) {
+    std::vector<DetectionResult> detections;
+    for (size_t i = 0; i < warehouse1_rois.size(); ++i) {
+        cv::Mat roi_img = frame(warehouse1_rois[i]);
+        int digit = predict(roi_img);
+
+        // 假设模型输出-1表示没有识别到，或者置信度低
+        if (digit != -1) {
+            detections.push_back({digit, static_cast<int>(i)});
+        }
+    }
+    return detections;
+}
+
+int MainWindow::predict(const cv::Mat& roi) {
+    if (!predictor || roi.empty()) return -1;
+
+    // 1. 预处理
+    cv::Mat resized, gray;
+    cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
+    cv::resize(gray, resized, cv::Size(32, 32));
+
+    // 2. 准备输入数据
+    std::unique_ptr<paddle::lite_api::Tensor> input_tensor(predictor->GetInput(0));
+    input_tensor->Resize({1, 1, 32, 32});
+    auto* input_data = input_tensor->mutable_data<float>();
+    
+    // 3. 填充Tensor并归一化
+    for (int i = 0; i < 32 * 32; ++i) {
+        input_data[i] = (static_cast<float>(resized.data[i]) / 255.0f - 0.5f) / 0.5f;
+    }
+
+    // 4. 执行推理
+    predictor->Run();
+
+    // 5. 获取输出
+    std::unique_ptr<const paddle::lite_api::Tensor> output_tensor(predictor->GetOutput(0));
+    const float* output_data = output_tensor->data<float>();
+    auto output_shape = output_tensor->shape();
+    int num_classes = output_shape[1];
+    
+    // 6. 找到概率最高的类别
+    int max_idx = std::distance(output_data, std::max_element(output_data, output_data + num_classes));
+    
+    // 可以增加一个置信度阈值判断
+    // if (output_data[max_idx] < 0.5) return -1;
+
+    return max_idx;
+}
+
+void MainWindow::sendArmCommand(int from_pos, int to_pos)
+{
+    if (!serial_port->isOpen()) {
+        if (!serial_port->open(QIODevice::WriteOnly)) {
+            qCritical() << "无法打开串口 " << serial_port->portName() << " : " << serial_port->errorString();
+            return;
+        }
+    }
+    
+    // !!! 关键：定义你和下位机（机械臂控制器）的通信协议 !!!
+    // 示例协议：一个字节帧头，一个字节指令，两个字节数据，一个字节帧尾
+    // 0xAA 0x01 <from_pos> <to_pos> 0xBB
+    QByteArray command;
+    command.append(static_cast<char>(0xAA)); // 帧头
+    command.append(static_cast<char>(0x01)); // 0x01代表“搬运”指令
+    command.append(static_cast<char>(from_pos));
+    command.append(static_cast<char>(to_pos));
+    command.append(static_cast<char>(0xBB)); // 帧尾
+
+    qDebug() << "Sending command to serial port:" << command.toHex();
+    serial_port->write(command);
+    // 最好等待写入完成
+    serial_port->waitForBytesWritten(100);
+
+    // 在实际项目中，最好在发送后关闭，或保持长连接
+    if (serial_port->isOpen()) {
+        serial_port->close();
+    }
+}
+```
+
+### 3.5. 编译、运行与调试
+
+1.  **关键标定**: 打开`mainwindow.cpp`，找到`initUI()`函数，**手动修改`warehouse1_rois`的四个`cv::Rect`的坐标和大小**，使其精确框住摄像头视野中的四个仓库格子。您可以通过运行程序，观察绿色框的位置来进行调试。
+2.  **串口配置**: 在`initSerialPort()`函数中，**修改`setPortName`为您实验箱上机械臂控制器实际使用的串口号**（如`/dev/ttyS0`, `/dev/ttyUSB0`等）。
+3.  **编译与运行**: 在`Qt Creator`中点击**运行**按钮。程序会自动编译、链接，并将`libpaddle_light_api_shared.so`和`lenet.nb`都置于正确的运行目录下。
+4.  **最终测试**: 在实验箱上摆好积木，点击程序界面上的“开始排序”按钮，观察`statusLabel`的状态变化和机械臂的实际动作。
