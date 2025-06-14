@@ -41,70 +41,60 @@
 
 1. **安装核心工具 (在PC终端)**:
 
-    ```bash
-    # 更新你的PC系统
-    sudo apt update && sudo apt upgrade -y
-    
-    # 安装项目所需的所有基础工具，包括 rsync
-    sudo apt install -y build-essential git python3-pip python3-venv wget curl rsync
-    ```
+        # 更新你的PC系统
+        sudo apt update && sudo apt upgrade -y
+        
+        # 安装项目所需的所有基础工具，包括 rsync
+        sudo apt install -y build-essential git python3-pip python3-venv wget curl rsync
 
 2. **配置独立的Python环境 (在PC终端)**:
     > **为什么？** 我们的实验箱使用Python 3.5，而新PC可能是Python 3.12。为了保证训练环境与AI框架（PaddlePaddle）兼容，我们需要一个特定版本的Python。`pyenv`是管理多个Python版本的最佳工具。
 
-    ```bash
-    # 1. 安装pyenv和它的编译依赖
-    sudo apt install -y make libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev llvm libncurses5-dev libncursesw5-dev xz-utils tk-dev libffi-dev liblzma-dev python3-openssl
-    curl https://pyenv.run | bash
-
-    # 2. 让pyenv在你的终端里生效
-    echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.bashrc
-    echo 'command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.bashrc
-    echo 'eval "$(pyenv init -)"' >> ~/.bashrc
-    exec "$SHELL"
-
-    # 3. 安装并指定Python版本
-    pyenv install 3.11.9
-    ```
+        # 1. 安装pyenv和它的编译依赖
+        sudo apt install -y make libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev llvm libncurses5-dev libncursesw5-dev xz-utils tk-dev libffi-dev liblzma-dev python3-openssl
+        curl https://pyenv.run | bash
+    
+        # 2. 让pyenv在你的终端里生效
+        echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.bashrc
+        echo 'command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.bashrc
+        echo 'eval "$(pyenv init -)"' >> ~/.bashrc
+        exec "$SHELL"
+    
+        # 3. 安装并指定Python版本
+        pyenv install 3.11.9
 
 3. **创建项目并激活虚拟环境 (在PC终端)**:
 
-    ```bash
-    # 1. 创建项目文件夹
-    mkdir ~/ai_arm_project
-    cd ~/ai_arm_project
-
-    # 2. 告诉pyenv，在这个文件夹里默认使用3.11.9版本
-    pyenv local 3.11.9
-
-    # 3. 创建一个隔离的Python“沙箱”（虚拟环境）
-    python -m venv venv
+        # 1. 创建项目文件夹
+        mkdir ~/ai_arm_project
+        cd ~/ai_arm_project
     
-    # 4. 进入这个“沙箱”
-    source venv/bin/activate
-    # 成功后，你的命令行提示符前会出现(venv)字样
-    ```
+        # 2. 告诉pyenv，在这个文件夹里默认使用3.11.9版本
+        pyenv local 3.11.9
+    
+        # 3. 创建一个隔离的Python“沙箱”（虚拟环境）
+        python -m venv venv
+        
+        # 4. 进入这个“沙箱”
+        source venv/bin/activate
+        # 成功后，你的命令行提示符前会出现(venv)字样
 
 4. **安装Python库 (在PC终端的(venv)环境下)**:
 
-    ```bash
-    pip install --upgrade pip
-    pip install paddlepaddle==2.6.1 -i https://pypi.tuna.tsinghua.edu.cn/simple
-    pip install opencv-python numpy
-    ```
+        pip install --upgrade pip
+        pip install paddlepaddle==2.6.1 -i https://pypi.tuna.tsinghua.edu.cn/simple
+        pip install opencv-python numpy
 
 5. **配置模型转换工具 (在PC终端)**:
 
-    ```bash
-    mkdir -p ~/tools
-    cd ~/tools
-    wget https://github.com/PaddlePaddle/Paddle-Lite/releases/download/v2.12.0/opt_linux_x86
-    chmod +x opt_linux_x86
-    mv opt_linux_x86 opt
-    echo 'export PATH=$PATH:~/tools' >> ~/.bashrc
-    source ~/.bashrc
-    opt # 验证是否成功
-    ```
+        mkdir -p ~/tools
+        cd ~/tools
+        wget https://github.com/PaddlePaddle/Paddle-Lite/releases/download/v2.12.0/opt_linux_x86
+        chmod +x opt_linux_x86
+        mv opt_linux_x86 opt
+        echo 'export PATH=$PATH:~/tools' >> ~/.bashrc
+        source ~/.bashrc
+        opt # 验证是否成功
 
 ### **步骤 0.3: 实验箱环境搭建 (实验箱操作员)**
 
@@ -112,26 +102,20 @@
 
 1. **安装基础软件 (在实验箱终端)**:
 
-    ```bash
-    sudo apt update
-    sudo apt install -y qtcreator qt5-default libopencv-dev openssh-server
-    ```
+        sudo apt update
+        sudo apt install -y qtcreator qt5-default libopencv-dev openssh-server
 
 2. **准备AI预测库**:
     * **PC操作员**: 从[PaddleLite Release页面](https://github.com/PaddlePaddle/Paddle-Lite/releases)下载适用于 **ARMv8 (aarch64)** 的C++预测库 (`inference_lite_lib.linux.aarch64...tar.gz`)。
     * **PC操作员**: 使用`scp`将这个压缩包上传到实验箱的家目录：
 
-        ```bash
-        # 在PC终端执行，记得替换IP
-        scp ./inference_lite_lib.linux.aarch64.gcc.tar.gz linux@192.168.1.101:~/
-        ```
+            # 在PC终端执行，记得替换IP
+            scp ./inference_lite_lib.linux.aarch64.gcc.tar.gz linux@192.168.1.101:~/
 
     * **实验箱操作员**: 在实验箱终端上解压它：
 
-        ```bash
-        mkdir -p ~/paddlelite_cpp
-        tar -zxvf ~/inference_lite_lib.linux.aarch64.gcc.tar.gz -C ~/paddlelite_cpp
-        ```
+            mkdir -p ~/paddlelite_cpp
+            tar -zxvf ~/inference_lite_lib.linux.aarch64.gcc.tar.gz -C ~/paddlelite_cpp
 
 ---
 
@@ -147,10 +131,8 @@
     * 在PC上创建一个名为 `collect_data.py` 的文件，并将下面给出的完整代码复制进去。
     * 使用`scp`将此脚本上传到**实验箱的桌面**:
 
-        ```bash
-        # 在PC终端执行，cd到脚本所在目录
-        scp ./collect_data.py linux@192.168.1.101:~/Desktop/
-        ```
+            # 在PC终端执行，cd到脚本所在目录
+            scp ./collect_data.py linux@192.168.1.101:~/Desktop/
 
 2. **执行数据采集 (实验箱操作员 & 物料员)**:
     * **操作员**在实验箱终端运行脚本: `cd ~/Desktop/` 然后 `python3 collect_data.py`。
@@ -166,11 +148,9 @@
 1. **执行Rsync同步 (在PC终端)**:
     > **为什么用Rsync？** 因为数据集很大，如果中途需要增补图片，`rsync`只会传输新增的部分，极大地节省时间。
 
-    ```bash
-    # cd到PC的项目目录: ~/ai_arm_project/
-    # 执行同步命令，将实验箱的文件夹同步到本地并重命名
-    rsync -avz --progress linux@192.168.1.101:~/Desktop/digital_images/ ./digital_raw_data
-    ```
+        # cd到PC的项目目录: ~/ai_arm_project/
+        # 执行同步命令，将实验箱的文件夹同步到本地并重命名
+        rsync -avz --progress linux@192.168.1.101:~/Desktop/digital_images/ ./digital_raw_data
 
 2. **验证**: 在PC上检查 `digital_raw_data` 文件夹内容是否完整。
 
@@ -180,27 +160,21 @@
 
 1. **数据划分**: 在PC项目目录中创建`split_dataset.py`文件（代码见上文），然后运行：
 
-    ```bash
-    python3 split_dataset.py
-    ```
+        python3 split_dataset.py
 
 2. **模型训练**: 在PC项目目录中创建`train.py`文件（代码见上文），然后运行：
 
-    ```bash
-    python3 train.py
-    ```
+        python3 train.py
 
     > **注意**: 确认`train.py`中LeNet模型的`linear1`层输入特征为`16*6*6`。
 
 3. **模型转换**:
 
-    ```bash
-    opt --model_file=./inference_model/lenet.pdmodel \
-        --param_file=./inference_model/lenet.pdiparams \
-        --optimize_out_type=naive_buffer \
-        --optimize_out=./lite_model \
-        --valid_targets=arm
-    ```
+        opt --model_file=./inference_model/lenet.pdmodel \
+            --param_file=./inference_model/lenet.pdiparams \
+            --optimize_out_type=naive_buffer \
+            --optimize_out=./lite_model \
+            --valid_targets=arm
 
     > **最终AI产出**: 一个名为 `lenet.nb` 的轻量级模型文件，位于 `lite_model` 文件夹中。
 
@@ -215,10 +189,8 @@
 1. **实验箱操作员**: 在实验箱上打开Qt Creator，新建一个`Qt Widgets Application`项目，命名为 `ArmSortApp`，保存在家目录 `~/` 下。
 2. **PC操作员**: 使用`scp`将`lenet.nb`模型文件精确地上传到刚刚创建的Qt项目文件夹中：
 
-    ```bash
-    # 在PC终端执行，cd到 ~/ai_arm_project/lite_model/ 目录
-    scp ./lenet.nb linux@192.168.1.101:~/ArmSortApp/
-    ```
+        # 在PC终端执行，cd到 ~/ai_arm_project/lite_model/ 目录
+        scp ./lenet.nb linux@192.168.1.101:~/ArmSortApp/
 
 ### **步骤 2: 开发Qt应用程序 (实验箱操作员)**
 
