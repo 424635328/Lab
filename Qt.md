@@ -2,6 +2,44 @@
 
 本手册将详细指导您如何在PC端的Qt Creator中，利用已准备好的交叉编译工具链和Sysroot，创建一个可以远程部署到实验箱的Qt项目。
 
+## **修复: 同步实验箱的Sysroot**
+
+**什么是Sysroot？** 简单来说，Sysroot是目标设备（实验箱）文件系统的一个“副本”，主要包含了编译和链接程序时所需的头文件 (`/usr/include`) 和库文件 (`/usr/lib`, `/lib`)。
+
+**为什么需要它？** 当我们在PC上交叉编译Qt程序时，程序不仅需要我们自己的代码，还需要链接实验箱上安装的Qt库、OpenCV库等。通过Sysroot，我们的交叉编译器可以在PC上就找到这些位于实验箱上的库文件和头文件。
+
+**操作步骤 (在您的PC终端上执行):**
+
+1.  **在PC上创建Sysroot目录**:
+    ```bash
+    mkdir -p ~/dev-kits/exp-box-sysroot
+    ```
+
+2.  **使用`rsync`从实验箱同步文件**:
+    > 这是`rsync`大显身手的又一个场景！我们只需要同步关键的库和头文件目录。
+    ```bash
+    # 将实验箱的 /lib 和 /usr 目录同步到我们PC上的sysroot文件夹中
+    # 请务必将IP地址替换为实际值
+    rsync -avz --progress --rsync-path="sudo rsync" linux@192.168.1.101:/lib ~/dev-kits/exp-box-sysroot/
+    rsync -avz --progress --rsync-path="sudo rsync" linux@192.168.1.101:/usr ~/dev-kits/exp-box-sysroot/
+    ```
+    *   `--rsync-path="sudo rsync"`: 这是一个高级技巧，因为实验箱上的 `/lib`, `/usr` 等目录需要`sudo`权限才能完整读取，这个参数让`rsync`在远程执行时自动带上`sudo`。
+
+3.  **修复Sysroot中的软链接 (关键步骤)**:
+    Sysroot中的许多库文件是软链接（shortcuts），它们指向的是绝对路径（如 `/lib/aarch64-linux-gnu/libm.so.6`）。这些链接在PC上是无效的。我们需要一个脚本来将它们修正为相对路径。
+    *   **下载修复脚本**:
+        ```bash
+        wget https://raw.githubusercontent.com/riscv/riscv-poky/master/scripts/sysroot-relativelinks.py
+        chmod +x sysroot-relativelinks.py
+        ```
+    *   **执行修复**:
+        ```bash
+        ./sysroot-relativelinks.py ~/dev-kits/exp-box-sysroot
+        ```
+    脚本会自动遍历并修复所有无效的软链接。
+
+---
+
 ## **前期准备确认**
 
 在开始本节内容前，请确保您已完成以下工作，并记录好相关路径：
